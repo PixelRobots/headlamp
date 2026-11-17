@@ -319,7 +319,8 @@ func isCatalogInstalledPlugin(pluginDir, pluginName string) bool {
 
 	packageJSONPath := filepath.Join(pluginPath, "package.json")
 
-	content, err := os.ReadFile(packageJSONPath) //nolint:gosec
+	//nolint:gosec // Plugin path is validated to stay within plugins directory
+	content, err := os.ReadFile(packageJSONPath)
 	if err != nil {
 		return false
 	}
@@ -676,5 +677,7 @@ func isSubdirectory(parentDir, dirPath string) bool {
 		return false
 	}
 
-	return !strings.HasPrefix(rel, "..") && !strings.HasPrefix(rel, ".")
+	// Reject the parent itself and any path that escapes it, but allow
+	// child directories whose names start with a dot.
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }

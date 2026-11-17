@@ -16,6 +16,8 @@
 
 import { defineConfig, devices } from '@playwright/test';
 
+process.env.PLAYWRIGHT_TEST_MODE = 'app';
+
 /**
  * Config for the desktop (Electron) app's e2e specs: this suite launches a
  * real Electron binary against a real minikube cluster via
@@ -26,6 +28,7 @@ import { defineConfig, devices } from '@playwright/test';
 export default defineConfig({
   testDir: './tests',
   testMatch: [
+    'appMenuZoom.spec.ts',
     'backendToken.spec.ts',
     'buildManifest.spec.ts',
     'buildManifestProduct.spec.ts',
@@ -36,12 +39,14 @@ export default defineConfig({
     'clusterRegistration.spec.ts',
     'externalBackendToken.spec.ts',
     'pluginSecureStorage.spec.ts',
+    'pluginManager.spec.ts',
     'listenerCleanup.spec.ts',
     'runCommand.spec.ts',
     'updateChecks.spec.ts',
     'oauthProvider.spec.ts',
     'protocolScheme.spec.ts',
     'frontendBuild.spec.ts',
+    'kubeConfigImport.spec.ts',
     'runtimeProductIdentity.spec.ts',
   ],
   timeout: 60 * 1000,

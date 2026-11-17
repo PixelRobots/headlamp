@@ -16,12 +16,17 @@
 
 import { renderHook } from '@testing-library/react';
 import App from '../../../../App';
+import CompositePodGroup from '../../../../lib/k8s/compositePodGroup';
 import ConfigMap from '../../../../lib/k8s/configMap';
 import CRD from '../../../../lib/k8s/crd';
 import Gateway from '../../../../lib/k8s/gateway';
+import HTTPRoute from '../../../../lib/k8s/httpRoute';
 import { KubeObject, KubeObjectClass } from '../../../../lib/k8s/KubeObject';
+import NetworkPolicy from '../../../../lib/k8s/networkpolicy';
 import PersistentVolumeClaim from '../../../../lib/k8s/persistentVolumeClaim';
 import Pod from '../../../../lib/k8s/pod';
+import PodGroup from '../../../../lib/k8s/podGroup';
+import SchedulingWorkload from '../../../../lib/k8s/schedulingWorkload';
 import Secret from '../../../../lib/k8s/secret';
 import Service from '../../../../lib/k8s/service';
 import TCPRoute from '../../../../lib/k8s/tcpRoute';
@@ -30,7 +35,12 @@ import { useNamespaces } from '../../../../redux/filterSlice';
 import { TestContext } from '../../../../test';
 import { GraphNode, Relation } from '../../graph/graphModel';
 import { makeKubeSourceId } from './graphDefinitionUtils';
-import { BUILT_IN_RELATION_IDS, matchesLabels, useGetAllRelations } from './relations';
+import {
+  BUILT_IN_RELATION_IDS,
+  matchesLabels,
+  matchesLabelSelector,
+  useGetAllRelations,
+} from './relations';
 
 vi.mock('../../../../redux/filterSlice', async importOriginal => ({
   ...(await importOriginal<typeof import('../../../../redux/filterSlice')>()),
@@ -83,7 +93,7 @@ const service = (
   cluster = 'cluster-a'
 ) => new Service({ metadata, spec: { selector, ports: [] }, status: {} } as any, cluster);
 
-type L4RouteClass = typeof TCPRoute | typeof UDPRoute;
+type L4RouteClass = typeof HTTPRoute | typeof TCPRoute | typeof UDPRoute;
 
 const l4Route = (
   RouteClass: L4RouteClass,
@@ -94,6 +104,35 @@ const l4Route = (
 
 const gateway = (metadata: Record<string, any>, cluster = 'cluster-a') =>
   new Gateway({ metadata, spec: { gatewayClassName: 'example' }, status: {} } as any, cluster);
+
+const podGroup = (
+  metadata: Record<string, any>,
+  spec: Record<string, any> = {},
+  cluster = 'cluster-a'
+) =>
+  new PodGroup(
+    { metadata, spec: { schedulingPolicy: { basic: {} }, ...spec }, status: {} } as any,
+    cluster
+  );
+
+const compositePodGroup = (
+  metadata: Record<string, any>,
+  spec: Record<string, any> = {},
+  cluster = 'cluster-a'
+) =>
+  new CompositePodGroup(
+    {
+      apiVersion: 'scheduling.k8s.io/v1alpha3',
+      kind: 'CompositePodGroup',
+      metadata,
+      spec: { schedulingPolicy: { gang: { minGroupCount: 2 } }, ...spec },
+      status: {},
+    } as any,
+    cluster
+  );
+
+const schedulingWorkload = (metadata: Record<string, any>, cluster = 'cluster-a') =>
+  new SchedulingWorkload({ metadata, spec: { podGroupTemplates: [] } } as any, cluster);
 
 describe('KubeObject class matching', () => {
   it('does not match a generic plugin object to a typed resource class', () => {
@@ -116,6 +155,46 @@ describe('matchesLabels', () => {
     expect(matchesLabels({ missing: 'value' }, item)).toBe(false);
     expect(matchesLabels({ app: 'web' }, pod({ uid: 'unlabelled' }))).toBeFalsy();
     expect(matchesLabels(undefined as any, item)).toBeFalsy();
+  });
+});
+
+describe('matchesLabelSelector', () => {
+  const web = pod({ uid: 'web', labels: { app: 'web', tier: 'frontend' } });
+  const db = pod({ uid: 'db', labels: { app: 'db', tier: 'frontend' } });
+  const unlabelled = pod({ uid: 'unlabelled' });
+
+  it('selects every item with an empty selector', () => {
+    expect(matchesLabelSelector({}, web)).toBe(true);
+    expect(matchesLabelSelector({}, unlabelled)).toBe(true);
+    expect(matchesLabelSelector(undefined, web)).toBe(false);
+  });
+
+  it('applies matchExpressions together with matchLabels', () => {
+    const appIn = { matchExpressions: [{ key: 'app', operator: 'In', values: ['web'] }] };
+    expect(matchesLabelSelector(appIn, web)).toBe(true);
+    expect(matchesLabelSelector(appIn, db)).toBe(false);
+    expect(matchesLabelSelector(appIn, unlabelled)).toBe(false);
+
+    const tierNotDb = {
+      matchLabels: { tier: 'frontend' },
+      matchExpressions: [{ key: 'app', operator: 'NotIn', values: ['db'] }],
+    };
+    expect(matchesLabelSelector(tierNotDb, web)).toBe(true);
+    expect(matchesLabelSelector(tierNotDb, db)).toBe(false);
+  });
+
+  it('supports Exists, DoesNotExist and NotIn on missing labels', () => {
+    const exists = { matchExpressions: [{ key: 'app', operator: 'Exists', values: [] }] };
+    const doesNotExist = {
+      matchExpressions: [{ key: 'app', operator: 'DoesNotExist', values: [] }],
+    };
+    const notIn = { matchExpressions: [{ key: 'app', operator: 'NotIn', values: ['db'] }] };
+
+    expect(matchesLabelSelector(exists, web)).toBe(true);
+    expect(matchesLabelSelector(exists, unlabelled)).toBe(false);
+    expect(matchesLabelSelector(doesNotExist, web)).toBe(false);
+    expect(matchesLabelSelector(doesNotExist, unlabelled)).toBe(true);
+    expect(matchesLabelSelector(notIn, unlabelled)).toBe(true);
   });
 });
 
@@ -168,7 +247,35 @@ describe('useGetAllRelations', () => {
     ).toBe(true);
   });
 
+  it('links NetworkPolicies to the Pods selected by their podSelector', () => {
+    vi.spyOn(CRD, 'useList').mockReturnValue({ items: null } as ReturnType<typeof CRD.useList>);
+    const { result } = renderUseGetAllRelations();
+    const relation = relationById(result.current, 'networkpolicy-pod');
+    const policy = (podSelector: Record<string, any>) =>
+      new NetworkPolicy(
+        {
+          metadata: { uid: 'np', name: 'np', namespace: 'namespace-a' },
+          spec: { podSelector, policyTypes: [] },
+        } as any,
+        'cluster-a'
+      );
+    const webPod = pod({
+      uid: 'web',
+      name: 'web',
+      namespace: 'namespace-a',
+      labels: { app: 'web' },
+    });
+    const dbPod = pod({ uid: 'db', name: 'db', namespace: 'namespace-a', labels: { app: 'db' } });
+    const bare = pod({ uid: 'bare', name: 'bare', namespace: 'namespace-a' });
+    const appIn = policy({ matchExpressions: [{ key: 'app', operator: 'In', values: ['web'] }] });
+
+    expect(relation.predicate(node(appIn), node(webPod))).toBe(true);
+    expect(relation.predicate(node(appIn), node(dbPod))).toBe(false);
+    expect(relation.predicate(node(policy({})), node(bare))).toBe(true);
+  });
+
   it.each([
+    ['HTTPRoute', HTTPRoute, 'httproute-gateway'],
     ['TCPRoute', TCPRoute, 'tcproute-gateway'],
     ['UDPRoute', UDPRoute, 'udproute-gateway'],
   ] as const)(
@@ -237,6 +344,7 @@ describe('useGetAllRelations', () => {
   );
 
   it.each([
+    ['HTTPRoute', HTTPRoute, 'httproute-service'],
     ['TCPRoute', TCPRoute, 'tcproute-service'],
     ['UDPRoute', UDPRoute, 'udproute-service'],
   ] as const)(
@@ -316,6 +424,17 @@ describe('useGetAllRelations', () => {
       'udproute-gateway',
       'udproute-service',
     ];
+
+    expect(result.current.map(relation => relation.id)).toEqual(
+      expect.arrayContaining(expectedIds)
+    );
+    expect(BUILT_IN_RELATION_IDS).toEqual(expect.arrayContaining(expectedIds));
+  });
+
+  it('registers the scheduling relation IDs as built-in', () => {
+    vi.spyOn(CRD, 'useList').mockReturnValue({ items: null } as ReturnType<typeof CRD.useList>);
+    const { result } = renderUseGetAllRelations();
+    const expectedIds = ['podgroup-workload', 'pod-podgroup'];
 
     expect(result.current.map(relation => relation.id)).toEqual(
       expect.arrayContaining(expectedIds)
@@ -446,6 +565,151 @@ describe('useGetAllRelations', () => {
         node(new KubeObject({ metadata: { uid: 'other' } } as any, 'cluster-a'))
       )
     ).toBe(false);
+  });
+
+  it('links pod groups to the workload they were templated from', () => {
+    vi.spyOn(CRD, 'useList').mockReturnValue({ items: null } as ReturnType<typeof CRD.useList>);
+    const { result } = renderUseGetAllRelations();
+    const relation = relationById(result.current, 'podgroup-workload');
+    const workload = schedulingWorkload({
+      uid: 'workload',
+      name: 'training',
+      namespace: 'namespace-a',
+    });
+    const groupOf = (spec: Record<string, any>, cluster = 'cluster-a') =>
+      podGroup({ uid: 'group', name: 'group', namespace: 'namespace-a' }, spec, cluster);
+
+    expect(
+      relation.predicate(
+        node(groupOf({ workloadRef: { workloadName: 'training', templateName: 'workers' } })),
+        node(workload)
+      )
+    ).toBe(true);
+
+    expect(
+      relation.predicate(
+        node(
+          groupOf({
+            podGroupTemplateRef: {
+              workload: { workloadName: 'training', podGroupTemplateName: 'workers' },
+            },
+          })
+        ),
+        node(workload)
+      )
+    ).toBe(true);
+
+    expect(
+      relation.predicate(
+        node(groupOf({ workloadRef: { workloadName: 'other', templateName: 'workers' } })),
+        node(workload)
+      )
+    ).toBe(false);
+
+    expect(relation.predicate(node(groupOf({})), node(workload))).toBe(false);
+
+    expect(
+      relation.predicate(
+        node(
+          groupOf(
+            { workloadRef: { workloadName: 'training', templateName: 'workers' } },
+            'cluster-b'
+          )
+        ),
+        node(workload)
+      )
+    ).toBe(false);
+
+    expect(
+      relation.predicate(
+        node(groupOf({ workloadRef: { workloadName: 'training', templateName: 'workers' } })),
+        node(
+          schedulingWorkload({
+            uid: 'other-namespace',
+            name: 'training',
+            namespace: 'namespace-b',
+          })
+        )
+      )
+    ).toBe(false);
+  });
+
+  it('links pods to their scheduling group', () => {
+    vi.spyOn(CRD, 'useList').mockReturnValue({ items: null } as ReturnType<typeof CRD.useList>);
+    const { result } = renderUseGetAllRelations();
+    const relation = relationById(result.current, 'pod-podgroup');
+    const group = podGroup({ uid: 'group', name: 'workers', namespace: 'namespace-a' });
+    const podIn = (podGroupName?: string, cluster = 'cluster-a') =>
+      pod(
+        { uid: 'pod', name: 'pod', namespace: 'namespace-a' },
+        podGroupName ? { schedulingGroup: { podGroupName } } : {},
+        cluster
+      );
+
+    expect(relation.predicate(node(podIn('workers')), node(group))).toBe(true);
+    expect(relation.predicate(node(podIn('leaders')), node(group))).toBe(false);
+    expect(relation.predicate(node(podIn()), node(group))).toBe(false);
+    expect(relation.predicate(node(podIn('workers', 'cluster-b')), node(group))).toBe(false);
+  });
+
+  it('links a root composite group to its workload and nests the children', () => {
+    vi.spyOn(CRD, 'useList').mockReturnValue({ items: null } as ReturnType<typeof CRD.useList>);
+    const { result } = renderUseGetAllRelations();
+    const toWorkload = relationById(result.current, 'compositepodgroup-workload');
+    const toParent = relationById(result.current, 'compositepodgroup-parent');
+    const workload = schedulingWorkload({
+      uid: 'workload',
+      name: 'llm-serving',
+      namespace: 'namespace-a',
+    });
+    const root = compositePodGroup(
+      { uid: 'root', name: 'serving', namespace: 'namespace-a' },
+      { workloadRef: { workloadName: 'llm-serving', templateName: 'serving' } }
+    );
+    const child = compositePodGroup(
+      { uid: 'child', name: 'prefill', namespace: 'namespace-a' },
+      {
+        workloadRef: { workloadName: 'llm-serving', templateName: 'prefill' },
+        parentCompositePodGroupName: 'serving',
+      }
+    );
+
+    expect(toWorkload.predicate(node(root), node(workload))).toBe(true);
+    expect(toWorkload.predicate(node(child), node(workload))).toBe(false);
+    expect(toParent.predicate(node(child), node(root))).toBe(true);
+    expect(toParent.predicate(node(root), node(root))).toBe(false);
+  });
+
+  it('links pod groups to their composite parent instead of straight to the workload', () => {
+    vi.spyOn(CRD, 'useList').mockReturnValue({ items: null } as ReturnType<typeof CRD.useList>);
+    const { result } = renderUseGetAllRelations();
+    const toComposite = relationById(result.current, 'podgroup-compositepodgroup');
+    const toWorkload = relationById(result.current, 'podgroup-workload');
+    const composite = compositePodGroup({
+      uid: 'composite',
+      name: 'prefill',
+      namespace: 'namespace-a',
+    });
+    const workload = schedulingWorkload({
+      uid: 'workload',
+      name: 'llm-serving',
+      namespace: 'namespace-a',
+    });
+    const nested = podGroup(
+      { uid: 'nested', name: 'prefill-0', namespace: 'namespace-a' },
+      {
+        workloadRef: { workloadName: 'llm-serving', templateName: 'prefill' },
+        parentCompositePodGroupName: 'prefill',
+      }
+    );
+    const flat = podGroup(
+      { uid: 'flat', name: 'workers', namespace: 'namespace-a' },
+      { workloadRef: { workloadName: 'llm-serving', templateName: 'workers' } }
+    );
+
+    expect(toComposite.predicate(node(nested), node(composite))).toBe(true);
+    expect(toWorkload.predicate(node(nested), node(workload))).toBe(false);
+    expect(toWorkload.predicate(node(flat), node(workload))).toBe(true);
   });
 
   it('marks pvc-pod edges as nonGroupingSide for RWX PVCs only', () => {

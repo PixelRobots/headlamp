@@ -16,10 +16,8 @@
 
 import { Box } from '@mui/system';
 import { lazy, memo, ReactElement, Suspense, useEffect } from 'react';
-import Deployment from '../../../lib/k8s/deployment';
-import JobSet from '../../../lib/k8s/jobSet';
-import LeaderWorkerSet from '../../../lib/k8s/leaderWorkerSet';
-import ReplicaSet from '../../../lib/k8s/replicaSet';
+// We use React.lazy below to load the workload classes so we don't create circular dependencies.
+import CompositePodGroupDetails from '../../compositePodGroup/Details';
 import ConfigDetails from '../../configmap/Details';
 import { CustomResourceDetails } from '../../crd/CustomResourceDetails';
 import CustomResourceDefinitionDetails from '../../crd/Details';
@@ -49,11 +47,13 @@ import { NetworkPolicyDetails } from '../../networkpolicy/Details';
 import NodeDetails from '../../node/Details';
 import PodDetails from '../../pod/Details';
 import PDBDetails from '../../podDisruptionBudget/Details';
+import PodGroupDetails from '../../podGroup/Details';
 import PriorityClassDetails from '../../priorityClass/Details';
 import ResourceQuotaDetails from '../../resourceQuota/Details';
 import RoleBindingDetails from '../../role/BindingDetails';
 import RoleDetails from '../../role/Details';
 import { RuntimeClassDetails } from '../../runtimeClass/Details';
+import SchedulingWorkloadDetails from '../../schedulingWorkload/Details';
 import SecretDetails from '../../secret/Details';
 import ServiceDetails from '../../service/Details';
 import ServiceAccountDetails from '../../serviceaccount/Details';
@@ -69,17 +69,53 @@ import WorkloadDetails from '../../workload/Details';
 
 // Avoid retaining the CronJob detail module unless the selected resource needs it.
 const CronJobDetails = lazy(() => import('../../cronjob/Details'));
+const DeploymentWorkloadDetails = lazy(() =>
+  import('../../../lib/k8s/deployment').then(m => ({
+    default: (props: any) => <WorkloadDetails {...props} workloadKind={m.default} />,
+  }))
+);
+const ReplicaSetWorkloadDetails = lazy(() =>
+  import('../../../lib/k8s/replicaSet').then(m => ({
+    default: (props: any) => <WorkloadDetails {...props} workloadKind={m.default} />,
+  }))
+);
+const JobSetWorkloadDetails = lazy(() =>
+  import('../../../lib/k8s/jobSet').then(m => ({
+    default: (props: any) => <WorkloadDetails {...props} workloadKind={m.default} />,
+  }))
+);
+const LeaderWorkerSetWorkloadDetails = lazy(() =>
+  import('../../../lib/k8s/leaderWorkerSet').then(m => ({
+    default: (props: any) => <WorkloadDetails {...props} workloadKind={m.default} />,
+  }))
+);
 
 const kindComponentMap: Record<
   string,
   (props: { name?: string; namespace?: string; cluster?: string }) => ReactElement
 > = {
   Pod: PodDetails,
-  Deployment: props => <WorkloadDetails {...props} workloadKind={Deployment} />,
-  ReplicaSet: props => <WorkloadDetails {...props} workloadKind={ReplicaSet} />,
+  Deployment: props => (
+    <Suspense fallback={null}>
+      <DeploymentWorkloadDetails {...props} />
+    </Suspense>
+  ),
+  ReplicaSet: props => (
+    <Suspense fallback={null}>
+      <ReplicaSetWorkloadDetails {...props} />
+    </Suspense>
+  ),
   Job: JobDetails,
-  JobSet: props => <WorkloadDetails {...props} workloadKind={JobSet} />,
-  LeaderWorkerSet: props => <WorkloadDetails {...props} workloadKind={LeaderWorkerSet} />,
+  JobSet: props => (
+    <Suspense fallback={null}>
+      <JobSetWorkloadDetails {...props} />
+    </Suspense>
+  ),
+  LeaderWorkerSet: props => (
+    <Suspense fallback={null}>
+      <LeaderWorkerSetWorkloadDetails {...props} />
+    </Suspense>
+  ),
   Service: ServiceDetails,
   CronJob: props => (
     <Suspense fallback={null}>
@@ -129,13 +165,12 @@ const kindComponentMap: Record<
   ReferenceGrant: ReferenceGrantDetails,
   BackendTLSPolicy: BackendTLSPolicyDetails,
   XBackendTrafficPolicy: BackendTLSPolicyDetails,
+  Workload: SchedulingWorkloadDetails,
+  CompositePodGroup: CompositePodGroupDetails,
+  PodGroup: PodGroupDetails,
 };
 
-export const canRenderDetails = (maybeKind: string) =>
-  maybeKind === 'customresource' ||
-  Object.entries(kindComponentMap).find(
-    ([key]) => key.toLowerCase() === maybeKind?.toLowerCase()
-  ) !== undefined;
+export { canRenderDetails } from './supportedKinds';
 
 function DetailsNotFound() {
   return null;

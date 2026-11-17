@@ -56,10 +56,11 @@ export interface FormField {
   type?: 'text' | 'number' | 'boolean' | 'labels' | 'select' | 'containers' | 'namespace' | 'ports';
   /** Whether the field is required. */
   required?: boolean;
-  /** Optional custom validity check for this (required) field. When provided,
-   *  it fully replaces the built-in type-based check in {@link isFieldValid},
-   *  receiving the current value at `path` and the full resource object. Use
-   *  for nested/structured values that the generic checks can't express. */
+  /** Optional custom validity check. On a required field it fully replaces the
+   *  built-in type-based check in {@link isFieldValid}. On an optional field it
+   *  is the only check, so it must also accept an empty/unset value. Receives
+   *  the current value at `path` and the full resource object. Use for
+   *  nested/structured values that the generic checks can't express. */
   validate?: (value: any, resource: Record<string, any>) => boolean;
   /** For 'number' fields: minimum allowed value. */
   min?: number;
@@ -138,7 +139,7 @@ export function metadataSection(t: (key: string) => string): FormSection {
   };
 }
 
-/** Check whether a required field's current value is valid for its type. */
+/** Check whether a required (or self-validating) field's current value is valid. */
 function isFieldValid(field: FormField, value: any, resource: Record<string, any>): boolean {
   // A field-supplied validator fully overrides the generic type-based checks.
   if (field.validate) {
@@ -201,11 +202,11 @@ export default function CreateResourceForm(props: CreateResourceFormProps) {
   const { sections, resource = {}, onChange, onValidChange } = props;
   const { t } = useTranslation(['translation', 'glossary']);
 
-  // Compute validity from current resource.
+  // Compute validity from current resource. Optional fields only count when they supply `validate`.
   const isValid = React.useMemo(() => {
     return sections
       .flatMap(s => s.fields)
-      .filter(f => f.required)
+      .filter(f => f.required || f.validate)
       .every(f => isFieldValid(f, _.get(resource, f.path), resource));
   }, [sections, resource]);
 
@@ -773,10 +774,28 @@ export interface LabelTextFieldProps {
   required?: boolean;
   /** Optional helper text shown via an info-icon tooltip next to the label. */
   helperText?: string;
+  /**
+   * Called with the editor rows whenever they change. Unlike `onChange`, rows with an
+   * empty or duplicate key are included, so callers can validate them.
+   */
+  onRowsChange?: (rows: LabelRow[]) => void;
+  /** Use Headlamp tag terminology instead of Kubernetes label terminology. */
+  terminology?: 'label' | 'tag';
+  /** Disable all editing controls. */
+  disabled?: boolean;
 }
 
 export function LabelTextField(props: LabelTextFieldProps) {
-  const { value, onChange, label, required, helperText } = props;
+  const {
+    value,
+    onChange,
+    label,
+    required,
+    helperText,
+    onRowsChange,
+    terminology = 'label',
+    disabled = false,
+  } = props;
   const { t } = useTranslation(['translation']);
   const groupLabelId = useId('label-group-');
 
@@ -794,7 +813,14 @@ export function LabelTextField(props: LabelTextFieldProps) {
     }
   }, [value]);
 
+  React.useEffect(() => {
+    onRowsChange?.(rows);
+  }, [rows, onRowsChange]);
+
   function commit(next: LabelRow[]) {
+    if (disabled) {
+      return;
+    }
     setRows(next);
     const map = labelRowsToMap(next);
     lastEmittedRef.current = map;
@@ -803,11 +829,12 @@ export function LabelTextField(props: LabelTextFieldProps) {
 
   function addLabel() {
     const used = new Set(rows.map(r => r.key));
-    let nextKey = 'new-label';
+    const keyPrefix = terminology === 'tag' ? 'new-tag' : 'new-label';
+    let nextKey = keyPrefix;
     let idx = 1;
     while (used.has(nextKey)) {
       idx += 1;
-      nextKey = `new-label-${idx}`;
+      nextKey = `${keyPrefix}-${idx}`;
     }
     commit([...rows, { id: nextLabelRowId(), key: nextKey, value: '' }]);
   }
@@ -837,24 +864,35 @@ export function LabelTextField(props: LabelTextFieldProps) {
       {rows.map(r => (
         <Box key={r.id} sx={{ display: 'flex', gap: 1, alignItems: 'center', mt: 2, mb: 2 }}>
           <FormTextField
+            disabled={disabled}
             label={t('translation|Key')}
             value={r.key}
             onChange={e => handleKeyEdit(r.id, e.target.value)}
-            inputProps={{ 'aria-label': t('translation|Label key') }}
+            inputProps={{
+              'aria-label':
+                terminology === 'tag' ? t('translation|Tag key') : t('translation|Label key'),
+            }}
           />
           <FormTextField
+            disabled={disabled}
             label={t('translation|Value')}
             value={r.value}
             onChange={e => handleValueEdit(r.id, e.target.value)}
-            inputProps={{ 'aria-label': t('translation|Label value') }}
+            inputProps={{
+              'aria-label':
+                terminology === 'tag' ? t('translation|Tag value') : t('translation|Label value'),
+            }}
           />
           <IconButton
+            disabled={disabled}
             onClick={() => handleDelete(r.id)}
             color="default"
             size="small"
-            aria-label={t('translation|Remove label {{ label }}', {
-              label: `${r.key}=${r.value}`,
-            })}
+            aria-label={
+              terminology === 'tag'
+                ? t('translation|Remove tag {{ tag }}', { tag: `${r.key}=${r.value}` })
+                : t('translation|Remove label {{ label }}', { label: `${r.key}=${r.value}` })
+            }
           >
             <Icon icon="mdi:close-circle" width={24} height={24} />
           </IconButton>
@@ -862,14 +900,15 @@ export function LabelTextField(props: LabelTextFieldProps) {
       ))}
       <Box sx={{ mt: 2 }}>
         <Button
+          disabled={disabled}
           onClick={addLabel}
           color="primary"
           size="small"
-          aria-label={t('translation|Add label')}
+          aria-label={terminology === 'tag' ? t('translation|Add tag') : t('translation|Add label')}
         >
           <Icon icon="mdi:plus-circle" width={24} height={24} />
           <Typography variant="body2" sx={{ ml: 0.5 }}>
-            {t('translation|New Label')}
+            {terminology === 'tag' ? t('translation|New Tag') : t('translation|New Label')}
           </Typography>
         </Button>
       </Box>
