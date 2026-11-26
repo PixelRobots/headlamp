@@ -18,7 +18,7 @@ import { Base64 } from 'js-base64';
 import { patch, post } from './api/v1/clusterRequests';
 import type { StreamArgs, StreamResultsCb } from './api/v1/streamingApi';
 import { stream } from './api/v1/streamingApi';
-import type { KubeCondition, KubeContainer, KubeContainerStatus, Time } from './cluster';
+import type { KubeContainer, KubeContainerStatus, PodCondition, Time } from './cluster';
 import type { KubeObjectInterface } from './KubeObject';
 import { KubeObject } from './KubeObject';
 import type { WorkloadHealthCategory } from './Workload';
@@ -44,6 +44,34 @@ export interface KubeVolume {
   [volumeName: string]: any;
 }
 
+export interface PodResourceClaim {
+  name: string;
+  resourceClaimName?: string;
+  resourceClaimTemplateName?: string;
+}
+
+export interface PodResourceClaimStatus {
+  name: string;
+  resourceClaimName?: string;
+}
+
+export interface PodExtendedResourceClaimStatus {
+  resourceClaimName: string;
+  requestMappings: {
+    containerName: string;
+    resourceName: string;
+    requestName: string;
+  }[];
+}
+
+export interface PodClaimReference {
+  source: 'claim' | 'template' | 'extendedResource';
+  podClaimName?: string;
+  claimName?: string;
+  templateName?: string;
+  containers: string[];
+}
+
 export interface KubePodSpec {
   containers: KubeContainer[];
   nodeName: string;
@@ -61,6 +89,8 @@ export interface KubePodSpec {
   priority?: number;
   priorityClassName?: string;
   runtimeClassName?: string;
+  /** Resources reserved for the pod sandbox, populated from its RuntimeClass at admission. */
+  overhead?: Record<string, string>;
   terminationGracePeriodSeconds?: number;
   tolerations?: any[];
   restartPolicy?: string;
@@ -71,12 +101,13 @@ export interface KubePodSpec {
   schedulingGroup?: {
     podGroupName: string;
   };
+  resourceClaims?: PodResourceClaim[];
 }
 
 export interface KubePod extends KubeObjectInterface {
   spec: KubePodSpec;
   status: {
-    conditions: KubeCondition[];
+    conditions: PodCondition[];
     containerStatuses: KubeContainerStatus[];
     initContainerStatuses?: KubeContainerStatus[];
     ephemeralContainerStatuses?: KubeContainerStatus[];
@@ -89,6 +120,8 @@ export interface KubePod extends KubeObjectInterface {
     reason?: string;
     nominatedNodeName?: string;
     startTime: Time;
+    resourceClaimStatuses?: PodResourceClaimStatus[];
+    extendedResourceClaimStatus?: PodExtendedResourceClaimStatus;
     [other: string]: any;
   };
 }
@@ -100,6 +133,8 @@ export interface ExecOptions extends StreamArgs {
 export interface LogOptions {
   /** The number of lines to display from the end side of the log */
   tailLines?: number;
+  /** Only return logs newer than this many seconds. Leave unset to not limit by time. */
+  sinceSeconds?: number;
   /** Whether to show the logs from previous runs of the container (only for restarted containers) */
   showPrevious?: boolean;
   /** Whether to show the timestamps in the logs */
@@ -160,6 +195,45 @@ class Pod extends KubeObject<KubePod> {
     return this.jsonData.status;
   }
 
+  get resourceClaims(): PodClaimReference[] {
+    const containers = [...(this.spec?.initContainers ?? []), ...(this.spec?.containers ?? [])];
+    const containersUsing = (claim: string) =>
+      containers
+        .filter(container => container.resources?.claims?.some(used => used.name === claim))
+        .map(container => container.name);
+
+    const references: PodClaimReference[] = (this.spec?.resourceClaims ?? []).map(claim => {
+      if (claim.resourceClaimName) {
+        return {
+          source: 'claim',
+          podClaimName: claim.name,
+          claimName: claim.resourceClaimName,
+          containers: containersUsing(claim.name),
+        };
+      }
+      return {
+        source: 'template',
+        podClaimName: claim.name,
+        claimName: this.status?.resourceClaimStatuses?.find(status => status.name === claim.name)
+          ?.resourceClaimName,
+        templateName: claim.resourceClaimTemplateName,
+        containers: containersUsing(claim.name),
+      };
+    });
+
+    const extended = this.status?.extendedResourceClaimStatus;
+    if (extended?.resourceClaimName) {
+      references.push({
+        source: 'extendedResource',
+        claimName: extended.resourceClaimName,
+        containers: [
+          ...new Set((extended.requestMappings ?? []).map(mapping => mapping.containerName)),
+        ],
+      });
+    }
+    return references;
+  }
+
   evict() {
     const url = `/api/v1/namespaces/${this.getNamespace()}/pods/${this.getName()}/eviction`;
     return post(
@@ -191,6 +265,7 @@ class Pod extends KubeObject<KubePod> {
     const [container, onLogs, logsOptions] = args as Parameters<newGetLogs>;
     const {
       tailLines = 100,
+      sinceSeconds,
       showPrevious = false,
       showTimestamps = false,
       follow = true,
@@ -207,6 +282,10 @@ class Pod extends KubeObject<KubePod> {
     // the tailLines number of logs.
     if (tailLines !== -1) {
       url += `&tailLines=${tailLines}`;
+    }
+
+    if (sinceSeconds !== undefined && sinceSeconds > 0) {
+      url += `&sinceSeconds=${sinceSeconds}`;
     }
 
     function unescapeStringLiterals(str: string): string {
@@ -394,7 +473,7 @@ class Pod extends KubeObject<KubePod> {
     return false;
   }
 
-  private hasPodReadyCondition(conditions: KubeCondition[]): boolean {
+  private hasPodReadyCondition(conditions: PodCondition[]): boolean {
     for (const condition of conditions) {
       if (condition.type === 'Ready' && condition.status === 'True') {
         return true;
@@ -503,6 +582,9 @@ class Pod extends KubeObject<KubePod> {
       restarts = restartableInitContainerRestarts;
       lastRestartDate = lastRestartableInitContainerRestartDate;
       let hasRunning = false;
+      // Reason and message of a container that exited with a non-zero code, if any
+      let errorReason = '';
+      let errorMessage = '';
       for (let i = (this.status?.containerStatuses?.length || 0) - 1; i >= 0; i--) {
         const container = this.status?.containerStatuses?.[i];
 
@@ -512,27 +594,34 @@ class Pod extends KubeObject<KubePod> {
         if (!!container.state.waiting?.reason) {
           reason = container.state.waiting.reason;
           message = container.state.waiting.message || '';
-        } else if (!!container.state.terminated?.reason) {
-          reason = container.state.terminated.reason;
-          message = container.state.terminated.message || '';
-        } else if (container.state.terminated?.reason === '') {
-          if (container.state.terminated.signal) {
+        } else if (!!container.state.terminated) {
+          if (!!container.state.terminated.reason) {
+            reason = container.state.terminated.reason;
+          } else if (container.state.terminated.signal) {
             reason = `Signal:${container.state.terminated.signal}`;
           } else {
             reason = `ExitCode:${container.state.terminated.exitCode}`;
           }
           message = container.state.terminated.message || '';
+          if (container.state.terminated.exitCode !== 0) {
+            errorReason = reason;
+            errorMessage = message;
+          }
         } else if (container.ready && !!container.state.running) {
           hasRunning = true;
           readyContainers++;
         }
       }
 
-      // change pod status back to "Running" if there is at least one container still reporting as "Running" status
-      if (reason === 'Completed' && hasRunning) {
-        if (this.hasPodReadyCondition(this.status?.conditions ?? [])) {
+      // A "Completed" container should not hide a running or failed one, as in kubectl:
+      // https://github.com/kubernetes/kubernetes/pull/124766
+      if (reason === 'Completed') {
+        if (hasRunning && this.hasPodReadyCondition(this.status?.conditions ?? [])) {
           reason = 'Running';
-        } else {
+        } else if (errorReason) {
+          reason = errorReason;
+          message = errorMessage;
+        } else if (hasRunning) {
           reason = 'NotReady';
         }
       }

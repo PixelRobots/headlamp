@@ -321,25 +321,9 @@ func GetNewToken(clientID, clientSecret string, tokenCache cache.Cache[interface
 // re-enabling verification while trusting the supplied certificate bundle.
 func ConfigureTLSContext(ctx context.Context, skipTLSVerify *bool, caCert *string) context.Context {
 	if skipTLSVerify != nil && *skipTLSVerify {
-		base, ok := http.DefaultTransport.(*http.Transport)
-		if !ok {
-			logger.Log(logger.LevelError, nil,
-				errors.New("http.DefaultTransport is not *http.Transport"),
-				"failed to configure TLS transport")
-
-			return ctx
-		}
-
-		tlsSkipTransport := base.Clone()
-
-		tlsCfg := &tls.Config{InsecureSkipVerify: true} //nolint:gosec
-		if base.TLSClientConfig != nil {
-			tlsCfg = base.TLSClientConfig.Clone()
-			tlsCfg.InsecureSkipVerify = true
-		}
-
-		tlsSkipTransport.TLSClientConfig = tlsCfg
-		ctx = oidc.ClientContext(ctx, &http.Client{Transport: tlsSkipTransport})
+		ctx = configureTLSClientContext(ctx, func(config *tls.Config) {
+			config.InsecureSkipVerify = true
+		})
 	}
 
 	if caCert != nil && *caCert != "" {
@@ -351,30 +335,55 @@ func ConfigureTLSContext(ctx context.Context, skipTLSVerify *bool, caCert *strin
 			return ctx
 		}
 
-		base, ok := http.DefaultTransport.(*http.Transport)
-		if !ok {
-			logger.Log(logger.LevelError, nil,
-				errors.New("http.DefaultTransport is not *http.Transport"),
-				"failed to configure TLS transport")
-
-			return ctx
-		}
-
-		customTransport := base.Clone()
-
-		tlsCfg := &tls.Config{RootCAs: caCertPool}
-		if base.TLSClientConfig != nil {
-			tlsCfg = base.TLSClientConfig.Clone()
-			tlsCfg.RootCAs = caCertPool
-		}
-
-		tlsCfg.InsecureSkipVerify = false
-
-		customTransport.TLSClientConfig = tlsCfg
-		ctx = oidc.ClientContext(ctx, &http.Client{Transport: customTransport})
+		ctx = configureTLSClientContext(ctx, func(config *tls.Config) {
+			config.RootCAs = caCertPool
+			config.InsecureSkipVerify = false
+		})
 	}
 
 	return ctx
+}
+
+func configureTLSClientContext(
+	ctx context.Context, configure func(*tls.Config),
+) context.Context {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		logger.Log(logger.LevelError, nil,
+			errors.New("http.DefaultTransport is not *http.Transport"),
+			"failed to configure TLS transport")
+
+		return ctx
+	}
+
+	transport := base.Clone()
+
+	config := &tls.Config{MinVersion: tls.VersionTLS12}
+	if base.TLSClientConfig != nil {
+		config = base.TLSClientConfig.Clone()
+	}
+
+	configure(config)
+	transport.TLSClientConfig = config
+
+	return oidc.ClientContext(ctx, &http.Client{Transport: transport})
+}
+
+// WithClientTimeout returns a context whose HTTP client, the one oidc.ClientContext stores,
+// has the given timeout. It copies the client already in ctx (for example the one
+// ConfigureTLSContext installed) or http.DefaultClient, keeps its Transport and leaves the
+// original untouched. The timeout is on the client and not on the context because the
+// context can outlive the request that created it. Call it after the client is configured.
+func WithClientTimeout(ctx context.Context, timeout time.Duration) context.Context {
+	client := http.DefaultClient
+	if existing, ok := ctx.Value(oauth2.HTTPClient).(*http.Client); ok && existing != nil {
+		client = existing
+	}
+
+	clientWithTimeout := *client
+	clientWithTimeout.Timeout = timeout
+
+	return oidc.ClientContext(ctx, &clientWithTimeout)
 }
 
 // RefreshAndCacheNewToken obtains a fresh OIDC token using the cached refresh token
@@ -625,6 +634,12 @@ func stringSliceFromJMESPaths(payload map[string]interface{}, paths []*jmespath.
 			return out
 		case []string:
 			return v
+		case string:
+			// The API server accepts a groups claim that is a single string,
+			// so treat it as one group rather than dropping it.
+			if v != "" {
+				return []string{v}
+			}
 		}
 	}
 

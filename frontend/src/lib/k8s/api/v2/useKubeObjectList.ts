@@ -403,6 +403,13 @@ function useWatchKubeObjectListsMultiplexed<K extends KubeObject>({
         stableQueryParams ?? {}
       ).queryKey;
 
+      // The watch's resource version expired, so it cannot report what changed since, such
+      // as deletions. List again to replace the cached list; the watch then resumes from it.
+      if (update.type === 'ERROR' && update.object?.code === 410) {
+        client.invalidateQueries({ queryKey });
+        return;
+      }
+
       // Update React Query cache with new data
       client.setQueryData(queryKey, (oldResponse: ListResponse<any> | undefined | null) => {
         if (!oldResponse) {
@@ -624,6 +631,29 @@ function flattenListRequests(
   );
 }
 
+/**
+ * Whether a currently-watched list is still covered by one of the given requests.
+ *
+ * An empty-string namespace is a real, valid value: it means "all namespaces" for a
+ * namespaced resource, and it is what a request with no namespace filter produces.
+ * Because it is falsy, matching it against a request's namespace list needs an
+ * explicit undefined check rather than a truthiness check, or the watch entry is
+ * dropped every render and immediately re-added, looping setState (see 9542b5cb5).
+ * The unfiltered branch keeps the falsy check on purpose, so a watch on '' still
+ * matches a request that asks for no particular namespace.
+ */
+export function isWatchedListStillRequested(
+  watching: { cluster: string; namespace?: string },
+  requests: Array<{ cluster: string; namespaces?: string[] }>
+): boolean {
+  return requests.some(request => {
+    if (watching.cluster !== request?.cluster) return false;
+    return !request.namespaces?.length
+      ? !watching.namespace
+      : watching.namespace !== undefined && request.namespaces.includes(watching.namespace);
+  });
+}
+
 function getPositiveLimit(queryParams: QueryParameters): number | undefined {
   const limit = Number(queryParams.limit);
 
@@ -676,7 +706,10 @@ export function useKubeObjectList<K extends KubeObject>({
   /** Return an empty list instead of a loading state when requests were intentionally suppressed. */
   emptyWhenNoRequests?: boolean;
 }): [Array<K> | null, ApiError | null] &
-  QueryListResponse<Array<ListResponse<K> | undefined | null>, K, ApiError> {
+  QueryListResponse<Array<ListResponse<K> | undefined | null>, K, ApiError> & {
+    /** Oldest successful query update in the combined list, or zero while unresolved. */
+    dataUpdatedAt: number;
+  } {
   const maybeNamespace = requests.find(it => it.namespaces)?.namespaces?.[0];
 
   // Get working endpoint from the first cluster
@@ -780,6 +813,10 @@ export function useKubeObjectList<K extends KubeObject>({
 
       return {
         data: results.map(result => result.data),
+        dataUpdatedAt: results.reduce(
+          (oldest, result) => Math.min(oldest, result.dataUpdatedAt),
+          results[0]?.dataUpdatedAt ?? 0
+        ),
         clusterResults,
         items:
           emptyWhenNoRequests && results.length === 0
@@ -815,14 +852,8 @@ export function useKubeObjectList<K extends KubeObject>({
 
   useEffect(() => {
     setListsToWatch(currentListsToWatch => {
-      const keptListsToWatch = currentListsToWatch.filter(
-        watching =>
-          requests.find(request => {
-            if (watching.cluster !== request?.cluster) return false;
-            return !request.namespaces?.length
-              ? !watching.namespace
-              : !!watching.namespace && request.namespaces.includes(watching.namespace);
-          }) !== undefined
+      const keptListsToWatch = currentListsToWatch.filter(watching =>
+        isWatchedListStillRequested(watching, requests)
       );
 
       if (!shouldWatch) {
@@ -1021,6 +1052,7 @@ export function useKubeObjectList<K extends KubeObject>({
   // @ts-ignore - TS compiler gets confused with iterators
   return {
     items: endpointError ? [] : query.items,
+    dataUpdatedAt: query.dataUpdatedAt,
     errors: endpointError ? [endpointError] : errors.length > 0 ? errors : null,
     error: endpointError ?? paginationError ?? query.errors.find(it => it !== null) ?? null,
     clusterResults: query.clusterResults,

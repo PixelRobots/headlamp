@@ -66,7 +66,7 @@ func SetTokenFromCookie(r *http.Request, clusterName string) {
 // the incoming request carries an OIDC token that is about to expire and, if
 // so, refreshes it transparently using the configured OIDC provider.
 //
-//nolint:funlen
+//nolint:funlen // Middleware handles token inspection, refresh lifecycle, cookie mutation, and telemetry
 func NewOIDCTokenRefreshMiddleware(config OIDCTokenRefreshConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -93,6 +93,16 @@ func NewOIDCTokenRefreshMiddleware(config OIDCTokenRefreshConfig) func(http.Hand
 			}()
 
 			if config.shouldSkipOIDCRefresh(w, r, span, &status, next) {
+				return
+			}
+
+			if headers, supplied := r.Header["Authorization"]; supplied &&
+				(len(headers) != 1 || BearerTokenValue(headers[0]) == "") {
+				status = "invalid_credentials"
+
+				logger.Log(logger.LevelWarn, nil, nil, "rejecting invalid supplied authorization before OIDC refresh")
+				http.Error(w, "invalid supplied authorization", http.StatusUnauthorized)
+
 				return
 			}
 

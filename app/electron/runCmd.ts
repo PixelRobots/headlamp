@@ -422,7 +422,7 @@ function confirmCommandDialog(command: string, mainWindow: BrowserWindow): boole
  * @param args - The arguments to the command.
  * @returns true if the user has consented to running the command, false otherwise.
  */
-function checkCommandConsent(
+export function checkCommandConsent(
   command: string,
   args: string[],
   mainWindow: BrowserWindow,
@@ -1175,6 +1175,9 @@ export async function handleRunCommand(
   let child: ChildProcessWithoutNullStreams;
   try {
     child = spawn(command, args, {
+      // Electron has no console on Windows, so each console program it
+      // starts would open a new, visible console window.
+      windowsHide: true,
       ...commandData.options,
       shell: false,
       env: {

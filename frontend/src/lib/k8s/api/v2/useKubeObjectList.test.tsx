@@ -22,6 +22,7 @@ import { ApiError } from './ApiError';
 import { clusterFetch } from './fetch';
 import {
   DEFAULT_LIST_LIMIT,
+  isWatchedListStillRequested,
   kubeObjectListQuery,
   ListResponse,
   makeListRequests,
@@ -236,6 +237,62 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+describe('isWatchedListStillRequested', () => {
+  // Regression test for 9542b5cb5: an empty-string namespace means "all namespaces"
+  // for a namespaced resource and is a valid, meaningful value — but it is falsy, so
+  // a naive truthiness check (`!watching.namespace`) treats it the same as "no
+  // namespace at all" and incorrectly drops the watch entry. It must never get
+  // "cleaned up" just because it's an empty string.
+  it('should keep a watch entry with an empty-string namespace when still requested', () => {
+    const watching = { cluster: 'default', namespace: '' };
+    const requests = [{ cluster: 'default', namespaces: [''] }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(true);
+  });
+
+  it('should drop a watch entry whose cluster is no longer requested', () => {
+    const watching = { cluster: 'default', namespace: '' };
+    const requests = [{ cluster: 'other-cluster', namespaces: [''] }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(false);
+  });
+
+  it('should keep a watch entry with no namespace for a non-namespaced resource', () => {
+    const watching = { cluster: 'default', namespace: undefined };
+    const requests = [{ cluster: 'default', namespaces: undefined }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(true);
+  });
+
+  // A request with no namespace filter is served by kubeObjectListQuery with its
+  // default namespace of '', so the resulting watch entry carries '' rather than
+  // undefined. It still matches that request.
+  it('should keep a watch entry with an empty-string namespace when the request has no namespaces', () => {
+    const watching = { cluster: 'default', namespace: '' };
+    const requests = [{ cluster: 'default', namespaces: undefined }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(true);
+  });
+
+  it('should drop a watch entry whose namespace is no longer requested', () => {
+    const watching = { cluster: 'default', namespace: 'gone' };
+    const requests = [{ cluster: 'default', namespaces: ['kept'] }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(false);
+  });
+
+  // The mirror image of the 9542b5cb5 regression: '' must not be read as "matches
+  // anything" either. Without this case, '' is never checked against a non-empty
+  // namespace list anywhere in the suite, so an implementation short-circuiting ''
+  // to a match would pass every other test here.
+  it('should drop a watch entry with an empty-string namespace when a specific namespace is requested', () => {
+    const watching = { cluster: 'default', namespace: '' };
+    const requests = [{ cluster: 'default', namespaces: ['default'] }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(false);
+  });
+});
+
 describe('useWatchKubeObjectLists', () => {
   beforeEach(() => {
     vi.stubEnv('REACT_APP_ENABLE_WEBSOCKET_MULTIPLEXER', 'false');
@@ -401,6 +458,47 @@ describe('useKubeObjectList', () => {
     vi.stubEnv('REACT_APP_ENABLE_WEBSOCKET_MULTIPLEXER', 'false');
     vi.clearAllMocks();
     localStorage.clear();
+  });
+
+  it('updates combined freshness when identical cached lists are refreshed', async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { staleTime: Infinity } },
+    });
+    const responses = ['a', 'b'].map(namespace => ({
+      list: makeListResponse(),
+      cluster: 'default',
+      namespace,
+    }));
+    const keys = responses.map(
+      response =>
+        kubeObjectListQuery(
+          mockClass,
+          { version: 'v1', resource: 'pods' },
+          response.namespace,
+          response.cluster,
+          {}
+        ).queryKey
+    );
+    queryClient.setQueryData(keys[0], responses[0], { updatedAt: 100 });
+    queryClient.setQueryData(keys[1], responses[1], { updatedAt: 200 });
+
+    const { result } = renderHook(
+      () =>
+        useKubeObjectList({
+          kubeObjectClass: mockClass,
+          requests: [{ cluster: 'default', namespaces: ['a', 'b'] }],
+          watch: false,
+        }),
+      { wrapper: queryClientWrapper(queryClient) }
+    );
+    await waitFor(() => expect(result.current.dataUpdatedAt).toBe(100));
+
+    act(() => queryClient.setQueryData(keys[0], responses[0], { updatedAt: 300 }));
+    await waitFor(() => expect(result.current.dataUpdatedAt).toBe(200));
+    act(() => queryClient.setQueryData(keys[1], responses[1], { updatedAt: 400 }));
+    await waitFor(() => expect(result.current.dataUpdatedAt).toBe(300));
+    expect(result.current.items).toEqual([]);
+    expect(mockClusterFetch).not.toHaveBeenCalled();
   });
 
   it('returns an empty result without fetching when no list requests are allowed', () => {
@@ -1601,6 +1699,36 @@ describe('useWatchKubeObjectLists (Multiplexer)', () => {
     );
 
     expect(spy).toHaveBeenCalledWith({ enabled: false, connections: [] });
+  });
+
+  it('should relist when the watch resource version expires', () => {
+    const queryClient = new QueryClient();
+    const endpoint = { version: 'v1', resource: 'pods' };
+    const queryKey = kubeObjectListQuery(mockClass, endpoint, 'a', 'default', {}).queryKey;
+    queryClient.setQueryData(queryKey, {
+      list: { items: [], metadata: { resourceVersion: '1' } },
+      cluster: 'default',
+    });
+    const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries');
+
+    renderHook(
+      () =>
+        useWatchKubeObjectLists({
+          kubeObjectClass: mockClass,
+          endpoint,
+          lists: [{ cluster: 'default', namespace: 'a', resourceVersion: '1' }],
+        }),
+      { wrapper: queryClientWrapper(queryClient) }
+    );
+
+    const onMessage = mockSubscribe.mock.calls[0][3];
+    onMessage({
+      type: 'ERROR',
+      object: { kind: 'Status', metadata: {}, reason: 'Expired', code: 410 },
+    });
+
+    // The watch cannot report what changed since, such as deletions, so the list is fetched again.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey });
   });
 
   it('should omit pagination query params after loading all pages', async () => {

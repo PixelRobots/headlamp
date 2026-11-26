@@ -36,12 +36,36 @@ const (
 
 // GetCookiePath returns the full cookie path including baseURL.
 func GetCookiePath(baseURL, cluster string) string {
+	cluster = escapeCookiePathSegment(cluster)
+
 	if baseURL != "" {
 		baseURL = "/" + strings.Trim(baseURL, "/")
 		return baseURL + "/clusters/" + cluster
 	}
 
 	return "/clusters/" + cluster
+}
+
+// escapeCookiePathSegment percent-encodes the bytes that browsers encode in a
+// URL path (the WHATWG path percent-encode set: controls, space, '"', '#', '<',
+// '>', '?', '`', '{', '}' and non-ASCII). Browsers match a cookie's Path against
+// the encoded request path, so a cluster named "my cluster" is requested as
+// /clusters/my%20cluster and never matches Path=/clusters/my cluster.
+// Other characters are left as is, because browsers send them unencoded.
+func escapeCookiePathSegment(s string) string {
+	var b strings.Builder
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c <= ' ' || c >= 0x7f || strings.IndexByte("\"#<>?`{}", c) >= 0 {
+			fmt.Fprintf(&b, "%%%02X", c)
+			continue
+		}
+
+		b.WriteByte(c)
+	}
+
+	return b.String()
 }
 
 // EncodeClusterForURL returns a path-safe representation of a cluster name.
@@ -91,6 +115,31 @@ func SanitizeClusterName(cluster string) string {
 	return sanitized
 }
 
+// GetForwardedProto extracts and normalizes the client protocol from the X-Forwarded-Proto header.
+// If multiple comma-separated protocols are present (e.g. from multi-tier reverse proxies),
+// the first (client-facing) protocol is returned in lowercase. Only "http" and "https" are recognized.
+func GetForwardedProto(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+
+	proto := r.Header.Get("X-Forwarded-Proto")
+	if proto == "" {
+		return ""
+	}
+
+	if before, _, found := strings.Cut(proto, ","); found {
+		proto = before
+	}
+
+	proto = strings.ToLower(strings.TrimSpace(proto))
+	if proto == "http" || proto == "https" {
+		return proto
+	}
+
+	return ""
+}
+
 // IsSecureContext determines if we should use secure cookies.
 func IsSecureContext(r *http.Request) bool {
 	// Check if request came over HTTPS
@@ -99,7 +148,7 @@ func IsSecureContext(r *http.Request) bool {
 	}
 
 	// Check X-Forwarded-Proto header (for reverse proxies)
-	if proto := r.Header.Get("X-Forwarded-Proto"); proto == "https" {
+	if GetForwardedProto(r) == "https" {
 		return true
 	}
 
@@ -136,7 +185,7 @@ func SetTokenCookie(
 	for i, chunk := range chunks {
 		// G124: Secure is set from IsSecureContext so localhost development still works;
 		// HttpOnly and SameSite are set unconditionally.
-		cookie := &http.Cookie{ //nolint:gosec
+		cookie := &http.Cookie{ //nolint:gosec // Secure attribute is dynamically set based on request context
 			Name:     fmt.Sprintf("headlamp-auth-%s.%d", sanitizedCluster, i),
 			Value:    chunk,
 			HttpOnly: true,
@@ -207,7 +256,7 @@ func ClearTokenCookie(w http.ResponseWriter, r *http.Request, cluster, baseURL s
 
 		// G124: Secure is set from IsSecureContext so localhost development still works;
 		// HttpOnly and SameSite are set unconditionally.
-		cookie := &http.Cookie{ //nolint:gosec
+		cookie := &http.Cookie{ //nolint:gosec // Secure attribute is dynamically set based on request context
 			Name:     cookieName,
 			Value:    "",
 			HttpOnly: true,
@@ -252,7 +301,7 @@ func boundedAuthTokenChunks(token string) ([]string, error) {
 func clearAuthTokenChunkCookie(w http.ResponseWriter, secure bool, cookiePath, sanitizedCluster string, index int) {
 	// G124: Secure is set from IsSecureContext so localhost development still works;
 	// HttpOnly and SameSite are set unconditionally.
-	cookie := &http.Cookie{ //nolint:gosec
+	cookie := &http.Cookie{ //nolint:gosec // Secure attribute is dynamically set based on request context
 		Name:     fmt.Sprintf("headlamp-auth-%s.%d", sanitizedCluster, index),
 		Value:    "",
 		HttpOnly: true,
@@ -292,7 +341,7 @@ func SetIDTokenCookie(
 	for i, chunk := range chunks {
 		// G124: Secure is set from IsSecureContext so localhost development still works;
 		// HttpOnly and SameSite are set unconditionally.
-		cookie := &http.Cookie{ //nolint:gosec
+		cookie := &http.Cookie{ //nolint:gosec // Secure attribute is dynamically set based on request context
 			Name:     fmt.Sprintf("headlamp-id-token-%s.%d", sanitizedCluster, i),
 			Value:    chunk,
 			HttpOnly: true,
@@ -381,7 +430,7 @@ func clearIDTokenChunkCookie(
 ) {
 	// G124: Secure is set from IsSecureContext so localhost development still works;
 	// HttpOnly and SameSite are set unconditionally.
-	cookie := &http.Cookie{ //nolint:gosec
+	cookie := &http.Cookie{ //nolint:gosec // Secure attribute is dynamically set based on request context
 		Name:     fmt.Sprintf("headlamp-id-token-%s.%d", sanitizedCluster, index),
 		Value:    "",
 		HttpOnly: true,

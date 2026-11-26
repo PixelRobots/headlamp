@@ -30,6 +30,11 @@ describe('parseRam', () => {
     expect(parseRam('')).toBe(0);
   });
 
+  it('preserves negative Kubernetes memory quantities', () => {
+    expect(parseRam('-1Gi')).toBe(-(1024 ** 3));
+    expect(parseRam('-500M')).toBe(-500000000);
+  });
+
   it('should parse binary units', () => {
     expect(parseRam('1Ki')).toBe(1024);
     expect(parseRam('1Mi')).toBe(1024 * 1024);
@@ -154,6 +159,9 @@ describe('parseDiskSpace', () => {
     expect(parseDiskSpace('1000m')).toBe(1);
     expect(parseDiskSpace('1000000u')).toBe(1);
     expect(parseDiskSpace('1000000000n')).toBe(1);
+  });
+  it('preserves negative disk quantities', () => {
+    expect(parseDiskSpace('-1Gi')).toBe(-(1024 ** 3));
   });
 });
 
@@ -317,5 +325,31 @@ describe('divideK8sResources', () => {
     // These should still work as before (memory)
     expect(divideK8sResources('1Gi', '1Mi')).toBe(1024);
     expect(divideK8sResources('1M', '1K')).toBe(1000);
+  });
+
+  it('should throw an error when divisor is zero or negative', () => {
+    expect(() => divideK8sResources('1Gi', '0')).toThrow('Divisor must be greater than 0: 0');
+    expect(() => divideK8sResources('1Gi', '0m')).toThrow('Divisor must be greater than 0: 0m');
+    expect(() => divideK8sResources('1Gi', '-1Gi')).toThrow('Divisor must be greater than 0: -1Gi');
+    expect(() => divideK8sResources('500m', '0', 'cpu')).toThrow(
+      'Divisor must be greater than 0: 0'
+    );
+    expect(() => divideK8sResources('500m', '0m', 'cpu')).toThrow(
+      'Divisor must be greater than 0: 0m'
+    );
+    expect(() => divideK8sResources('500m', '-1', 'cpu')).toThrow(
+      'Divisor must be greater than 0: -1'
+    );
+  });
+
+  it('should throw an error when divisor is empty or invalid', () => {
+    expect(() => divideK8sResources('1Gi', '')).toThrow('Divisor must be greater than 0: ');
+    expect(() => divideK8sResources('1Gi', 'invalid')).toThrow(
+      'Divisor must be greater than 0: invalid'
+    );
+    expect(() => divideK8sResources('500m', '', 'cpu')).toThrow('Divisor must be greater than 0: ');
+    expect(() => divideK8sResources('500m', 'invalid', 'cpu')).toThrow(
+      'Divisor must be greater than 0: invalid'
+    );
   });
 });

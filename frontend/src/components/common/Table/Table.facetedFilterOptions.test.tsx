@@ -137,7 +137,9 @@ function dropdownOptions() {
   );
 }
 
-describe('Table select filter options with real MRT', () => {
+// Several tests render a dropdown with 1000 options, which is slow in jsdom and can exceed the
+// default 5s timeout on a busy machine or when the whole suite runs in parallel.
+describe('Table select filter options with real MRT', { timeout: 30_000 }, () => {
   it.each(['multi-select', 'select'] as const)(
     'fills the %s dropdown although faceted values are disabled',
     filterVariant => {
@@ -287,6 +289,37 @@ describe('Table select filter options with real MRT', () => {
     // Opening the menu here would render a thousand items, which jsdom is too slow for.
     // That the value is still among the options is covered in Table.test.tsx.
     expect(statusFilterInput()).toHaveTextContent('rare-1');
+  });
+
+  it.each(['multi-select', 'select'] as const)(
+    'keeps showing a %s selection after a refresh took the value out of the rows',
+    filterVariant => {
+      // A pod that was filtered for is gone after the next list update. The rows stay
+      // filtered by it, so the input must still say by what.
+      const data: StatusRow[] = [...largeData, { status: 'gone-soon' }];
+      const value = filterVariant === 'select' ? 'gone-soon' : ['gone-soon'];
+      const props = {
+        filterVariant,
+        initialState: { columnFilters: [{ id: 'status', value }] },
+      };
+      const rendered = renderStatusTable({ ...props, data });
+      expect(statusFilterInput()).toHaveTextContent('gone-soon');
+
+      rendered.rerender(statusTable({ ...props, data: largeData }));
+
+      expect(statusFilterInput()).toHaveTextContent('gone-soon');
+    }
+  );
+
+  it('does not turn the typed text of an autocomplete filter into an option', () => {
+    renderStatusTable({
+      filterVariant: 'autocomplete',
+      initialState: { columnFilters: [{ id: 'status', value: 'Runn' }] },
+    });
+
+    fireEvent.keyDown(statusFilterInput(), { key: 'ArrowDown' });
+
+    expect(dropdownOptions()).toEqual(['Completed', 'Running']);
   });
 
   it('keeps the full faceting contract for non-dropdown columns while faceting is on', () => {

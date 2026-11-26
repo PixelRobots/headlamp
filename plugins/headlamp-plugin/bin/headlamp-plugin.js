@@ -29,6 +29,7 @@ const child_process = require('child_process');
 const validate = require('validate-npm-package-name');
 const yargs = require('yargs/yargs');
 const headlampPluginPkg = require('../package.json');
+const { getNativeTypeScriptCommand, getUpgradeOverrides } = require('./typescript');
 const { PluginManager, MultiPluginManager } = require('@headlamp-k8s/pluginctl');
 const { table } = require('table');
 const tar = require('tar');
@@ -152,22 +153,18 @@ function create(name, link, noInstall) {
       const npmJsPkg = JSON.parse(npmJsPkgResponse);
       const npmJsIntegrity = npmJsPkg.integrity;
 
-      // Now replace integrity in the package-lock.json to match npmjs registry integrity.
+      // Now set integrity in the package-lock.json to match npmjs registry integrity.
+      // The template has none for @kinvolk/headlamp-plugin, since it's made from a
+      // local "npm pack" whose integrity never matches the published package.
       // "node_modules/@kinvolk/headlamp-plugin": {
       //   "version": "0.13.0-alpha.13",
       //   "resolved": "...",
       //   "integrity": "sha512-..."
-      const packageLockContent = fs.readFileSync(packageLockPath, 'utf8');
-      const integrityPattern = new RegExp(
-        `("node_modules/@kinvolk/headlamp-plugin": \\{[\\s\\S]*?"integrity": ")[^"]+(")`,
-        'g'
-      );
-      const packageLockContentNew = packageLockContent.replace(
-        integrityPattern,
-        `$1${npmJsIntegrity}$2`
-      );
-      if (packageLockContent !== packageLockContentNew) {
-        fs.writeFileSync(packageLockPath, packageLockContentNew);
+      const packageLock = JSON.parse(fs.readFileSync(packageLockPath, 'utf8'));
+      const headlampPluginLock = packageLock.packages?.['node_modules/@kinvolk/headlamp-plugin'];
+      if (headlampPluginLock && headlampPluginLock.integrity !== npmJsIntegrity) {
+        headlampPluginLock.integrity = npmJsIntegrity;
+        fs.writeFileSync(packageLockPath, JSON.stringify(packageLock, null, 2) + '\n');
       }
 
       useNpmCi = true;
@@ -671,9 +668,10 @@ async function start() {
  * @param scriptName {string} - name of the script to run.
  * @param cmdLine {string} - command line to run.
  * @param env {object} - environment variables to run the command with.
+ * @param {(projectDirectory: string) => { file: string, args: string[] } | undefined} [resolveCommand]
  * @returns {0 | 1} - Exit code, where 0 is success, 1 is failure.
  */
-function runScriptOnPackages(packageFolder, scriptName, cmdLine, env) {
+function runScriptOnPackages(packageFolder, scriptName, cmdLine, env, resolveCommand) {
   if (!fs.existsSync(packageFolder)) {
     console.error(`"${packageFolder}" does not exist. Not ${scriptName}-ing.`);
     return 1;
@@ -710,55 +708,62 @@ function runScriptOnPackages(packageFolder, scriptName, cmdLine, env) {
       console.log(`Finished npm install.`);
     }
 
-    // See if the cmd is in the:
-    // - package/node_modules/.bin
-    // - package/../node_modules/.bin
-    // - the npx node_modules/.bin
-    // If not, just use the original cmdLine and hope for the best :)
-    let cmdLineToUse = cmdLine;
-    const scriptCmd = cmdLine.split(' ')[0];
-    const scriptCmdRest = cmdLine.split(' ').slice(1).join(' ');
-
-    const nodeModulesBinCmd = path.join('node_modules', '.bin', scriptCmd + binExt);
-    const upNodeModulesBinCmd = path.join('../', nodeModulesBinCmd);
-
-    // When run as npx, find it in the node_modules npx uses
-    const headlampPluginBin = fs.realpathSync(process.argv[1]);
-    const npxBinCmd = path.join(
-      path.dirname(headlampPluginBin),
-      '..',
-      '..',
-      '..',
-      '..',
-      nodeModulesBinCmd
-    );
-
-    if (fs.existsSync(nodeModulesBinCmd)) {
-      cmdLineToUse = nodeModulesBinCmd + ' ' + scriptCmdRest;
-    } else if (fs.existsSync(upNodeModulesBinCmd)) {
-      cmdLineToUse = upNodeModulesBinCmd + ' ' + scriptCmdRest;
-    } else if (fs.existsSync(npxBinCmd)) {
-      cmdLineToUse = npxBinCmd + ' ' + scriptCmdRest;
-    } else {
-      console.warn(
-        `"${scriptCmd}" not found in "${resolve(nodeModulesBinCmd)}" or "${resolve(
-          upNodeModulesBinCmd
-        )}" or "${resolve(npxBinCmd)}".`
-      );
-    }
-
-    console.log(`"${folder}": ${scriptName}-ing, :${cmdLineToUse}:...`);
-
-    const [cmd, ...args] = cmdLineToUse.split(' ');
-
     try {
-      child_process.execFileSync(...viaCmd(cmd, args), {
+      const command = resolveCommand?.(process.cwd());
+      /** @type {[string, string[]]} */
+      let execution;
+      if (command) {
+        execution = [command.file, command.args];
+      } else {
+        // See if the cmd is in the:
+        // - package/node_modules/.bin
+        // - package/../node_modules/.bin
+        // - the npx node_modules/.bin
+        // If not, just use the original cmdLine and hope for the best :)
+        let cmdLineToUse = cmdLine;
+        const scriptCmd = cmdLine.split(' ')[0];
+        const scriptCmdRest = cmdLine.split(' ').slice(1).join(' ');
+
+        const nodeModulesBinCmd = path.join('node_modules', '.bin', scriptCmd + binExt);
+        const upNodeModulesBinCmd = path.join('../', nodeModulesBinCmd);
+
+        // When run as npx, find it in the node_modules npx uses
+        const headlampPluginBin = fs.realpathSync(process.argv[1]);
+        const npxBinCmd = path.join(
+          path.dirname(headlampPluginBin),
+          '..',
+          '..',
+          '..',
+          '..',
+          nodeModulesBinCmd
+        );
+
+        if (fs.existsSync(nodeModulesBinCmd)) {
+          cmdLineToUse = nodeModulesBinCmd + ' ' + scriptCmdRest;
+        } else if (fs.existsSync(upNodeModulesBinCmd)) {
+          cmdLineToUse = upNodeModulesBinCmd + ' ' + scriptCmdRest;
+        } else if (fs.existsSync(npxBinCmd)) {
+          cmdLineToUse = npxBinCmd + ' ' + scriptCmdRest;
+        } else {
+          console.warn(
+            `"${scriptCmd}" not found in "${resolve(nodeModulesBinCmd)}" or "${resolve(
+              upNodeModulesBinCmd
+            )}" or "${resolve(npxBinCmd)}".`
+          );
+        }
+
+        const [cmd, ...args] = cmdLineToUse.split(' ');
+        execution = viaCmd(cmd, args);
+      }
+
+      console.log(`"${folder}": ${scriptName}-ing, :${execution[0]} ${execution[1].join(' ')}:...`);
+      child_process.execFileSync(...execution, {
         stdio: 'inherit',
         encoding: 'utf8',
         env: { ...process.env, ...(env || {}) },
       });
     } catch (e) {
-      console.error(`Problem running ${scriptName} inside of "${folder}"\r\n`);
+      console.error(`Problem running ${scriptName} inside of "${folder}"\r\n`, e.message);
       process.chdir(oldCwd);
       return runOnPackageReturn.issue;
     }
@@ -823,6 +828,7 @@ function runScriptOnPackages(packageFolder, scriptName, cmdLine, env) {
       );
       return 1; // failed
     }
+    return 0;
   }
 
   return exitCode > 0 ? 1 : 0;
@@ -941,33 +947,37 @@ async function build(packageFolder) {
 
     process.chdir(folder);
 
-    // Read package.json to get plugin name
-    const packageJson = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-    const pluginName = packageJson.name || path.basename(folder);
-
-    console.log(`Building "${folder}" for production with plugin name: ${pluginName}...`);
-
-    const config = await viteConfigPromise;
-    const vite = await vitePromise;
-
-    // Clone the config and add plugin name injection
-    const buildConfig = { ...config.default };
-
-    // Add plugin name injection to the plugins array
-    if (!buildConfig.plugins) {
-      buildConfig.plugins = [];
-    }
-
-    if (typeof process.env.NODE_ENV === 'undefined') {
-      process.env.NODE_ENV = 'production';
-    }
-    injectEnvVars(buildConfig);
-
-    // Import the plugin name injection plugin
-    const { pluginNameInjection } = await import('../config/vite-plugin-name-injection.mjs');
-    buildConfig.plugins.push(pluginNameInjection({ pluginName }));
-
     try {
+      // Read package.json to get plugin name
+      const packageJson = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+      const pluginName = packageJson.name || path.basename(folder);
+
+      console.log(`Building "${folder}" for production with plugin name: ${pluginName}...`);
+
+      const config = await viteConfigPromise;
+      const vite = await vitePromise;
+
+      // Clone the config and add plugin name injection
+      const buildConfig = {
+        ...config.default,
+        root: process.cwd(),
+        define: { ...config.default.define },
+        plugins: [...(config.default.plugins || [])],
+        build: {
+          ...config.default.build,
+          lib: { ...config.default.build.lib, entry: path.resolve('src/index.tsx') },
+        },
+      };
+
+      if (typeof process.env.NODE_ENV === 'undefined') {
+        process.env.NODE_ENV = 'production';
+      }
+      injectEnvVars(buildConfig);
+
+      // Import the plugin name injection plugin
+      const { pluginNameInjection } = await import('../config/vite-plugin-name-injection.mjs');
+      buildConfig.plugins.push(pluginNameInjection({ pluginName }));
+
       await vite.build(buildConfig);
 
       // Copy extra dist files after successful build
@@ -978,17 +988,18 @@ async function build(packageFolder) {
       await brotliCompressDist(distDir);
 
       console.log(`Finished building "${folder}" for production.`);
+
+      return true;
     } catch (e) {
       console.error(e);
       console.error(`Failed to build "${folder}" for production.`);
-      process.exit(1);
+      return false;
+    } finally {
+      process.chdir(oldCwd);
     }
-
-    process.chdir(oldCwd);
-    return true;
   }
 
-  function buildFolderOfPackages() {
+  async function buildFolderOfPackages() {
     const folders = fs.readdirSync(packageFolder, { withFileTypes: true }).filter(fileName => {
       return (
         fileName.isDirectory() &&
@@ -996,17 +1007,19 @@ async function build(packageFolder) {
       );
     });
 
-    folders.forEach(folder => {
+    for (const folder of folders) {
       const folderToBuild = path.join(packageFolder, folder.name);
-      if (!buildPackage(folderToBuild)) {
-        console.error(`"${folderToBuild}" does not contain a package. Not building.`);
-      }
-    });
+      if (!(await buildPackage(folderToBuild))) return false;
+    }
     return folders.length !== 0;
   }
 
-  if (!(buildPackage(packageFolder) || buildFolderOfPackages())) {
-    console.error(`"${packageFolder}" does not contain a package or packages. Not building.`);
+  const built = fs.existsSync(path.join(packageFolder, 'package.json'))
+    ? await buildPackage(packageFolder)
+    : await buildFolderOfPackages();
+  if (!built) {
+    console.error(`Failed to build package or packages in "${packageFolder}".`);
+    return 1;
   }
 
   return 0;
@@ -1196,6 +1209,8 @@ function upgrade(packageFolder, skipPackageUpdates, headlampPluginVersion) {
 
     // Update these scripts keys to match the template.
     replaceNestedKeys('scripts', ['tsc', 'storybook', 'test', 'storybook-build', 'i18n']);
+
+    templatePackageJson.overrides = getUpgradeOverrides(packageJson, templatePackageJson.overrides);
 
     // replace top level keys
     const checkKeys = ['eslintConfig', 'prettier', 'overrides'];
@@ -1447,7 +1462,7 @@ function lint(packageFolder, fix) {
  */
 function tsc(packageFolder) {
   const script = 'tsc --noEmit';
-  return runScriptOnPackages(packageFolder, 'tsc', script, {});
+  return runScriptOnPackages(packageFolder, 'tsc', script, {}, getNativeTypeScriptCommand);
 }
 
 /**
@@ -1457,23 +1472,8 @@ function tsc(packageFolder) {
  * @returns {0 | 1} Exit code, where 0 is success, 1 is failure.
  */
 function storybook(packageFolder) {
-  try {
-    child_process.execSync(
-      './node_modules/.bin/storybook dev -p 6007 -c node_modules/@kinvolk/headlamp-plugin/config/.storybook',
-      {
-        stdio: 'inherit',
-        cwd: packageFolder,
-        encoding: 'utf8',
-      }
-    );
-  } catch (e) {
-    console.error(
-      `Problem running storybook dev inside of "${packageFolder}" abs: "${resolve(packageFolder)}"`
-    );
-    return 1;
-  }
-
-  return 0;
+  const script = `storybook dev -p 6007 -c node_modules/@kinvolk/headlamp-plugin/config/.storybook`;
+  return runScriptOnPackages(packageFolder, 'storybook dev', script, {});
 }
 
 /**

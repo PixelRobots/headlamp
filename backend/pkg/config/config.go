@@ -1,30 +1,47 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package config
 
 import (
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/knadh/koanf"
 	"github.com/knadh/koanf/providers/basicflag"
 	"github.com/knadh/koanf/providers/env"
-	"github.com/kubernetes-sigs/headlamp/backend/pkg/clusterinventory"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/clusterdiscovery"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/logger"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/spa"
 	"k8s.io/apimachinery/pkg/labels"
-	"sigs.k8s.io/cluster-inventory-api/pkg/access"
 )
 
 const (
 	defaultPort       = 4466
 	defaultSessionTTL = 86400 // 24 hours in seconds
+	maxPort           = 65535
 	osWindows         = "windows"
 )
 
@@ -50,7 +67,6 @@ type Config struct {
 	CacheEnabled           bool   `koanf:"cache-enabled"`
 	EnableHelm             bool   `koanf:"enable-helm"`
 	EnableDynamicClusters  bool   `koanf:"enable-dynamic-clusters"`
-	EnableClusterInventory bool   `koanf:"enable-cluster-inventory"`
 	AllowKubeconfigChanges bool   `koanf:"allow-kubeconfig-changes"`
 	ListenAddr             string `koanf:"listen-addr"`
 	WatchPluginsChanges    bool   `koanf:"watch-plugins-changes"`
@@ -67,16 +83,17 @@ type Config struct {
 	NodeShellImage         string `koanf:"node-shell-image"`
 	NodeShellNamespace     string `koanf:"node-shell-namespace"`
 	ProxyURLs              string `koanf:"proxy-urls"`
+	BackstageOrigin        string `koanf:"backstage-origin"`
 
-	ClusterInventoryProviderFile          string        `koanf:"cluster-inventory-provider-file"`
-	ClusterInventoryLabelSelector         string        `koanf:"cluster-inventory-label-selector"`
-	ClusterInventoryNamespaces            string        `koanf:"cluster-inventory-namespaces"`
-	ClusterInventoryRootReconcileInterval time.Duration `koanf:"cluster-inventory-root-reconcile-interval"`
-	ClusterInventoryNoCRDCacheTTL         time.Duration `koanf:"cluster-inventory-no-crd-cache-ttl"`
+	ClusterInventoryProviderFile string `koanf:"cluster-inventory-provider-file"`
+
+	DiscoverySources map[string]clusterdiscovery.Settings `koanf:"-"`
 
 	OidcClientID                 string `koanf:"oidc-client-id"`
+	OidcClientIDFile             string `koanf:"oidc-client-id-file"`
 	OidcValidatorClientID        string `koanf:"oidc-validator-client-id"`
 	OidcClientSecret             string `koanf:"oidc-client-secret"`
+	OidcClientSecretFile         string `koanf:"oidc-client-secret-file"`
 	OidcIdpIssuerURL             string `koanf:"oidc-idp-issuer-url"`
 	OidcCallbackURL              string `koanf:"oidc-callback-url"`
 	OidcValidatorIdpIssuerURL    string `koanf:"oidc-validator-idp-issuer-url"`
@@ -100,6 +117,19 @@ type Config struct {
 	UnsafeUseServiceAccountToken bool   `koanf:"unsafe-use-service-account-token"`
 	ServiceAccountTokenPath      string `koanf:"service-account-token-path"`
 	OidcAutoLogin                bool   `koanf:"oidc-auto-login"`
+
+	// OidcAPIProxy is the URL of an external Kubernetes API proxy through
+	// which all Kubernetes API requests are routed instead of the
+	// kube-apiserver directly. The OIDC bearer token is forwarded as-is
+	// in the Authorization header.
+	OidcAPIProxy string `koanf:"oidc-api-proxy"`
+	// OidcAPIProxyCAFile is the path to a PEM-encoded CA bundle used to
+	// verify the TLS certificate of the api-proxy. Optional.
+	OidcAPIProxyCAFile string `koanf:"oidc-api-proxy-ca-file"`
+	// OidcAPIProxySkipTLSVerify disables TLS verification for the api-proxy
+	// connection. Use only for testing.
+	OidcAPIProxySkipTLSVerify bool `koanf:"oidc-api-proxy-skip-tls-verify"`
+
 	// telemetry configs
 	ServiceName        string   `koanf:"service-name"`
 	ServiceVersion     *string  `koanf:"service-version"`
@@ -110,6 +140,8 @@ type Config struct {
 	UseOTLPHTTP        *bool    `koanf:"use-otlp-http"`
 	StdoutTraceEnabled *bool    `koanf:"stdout-trace-enabled"`
 	SamplingRate       *float64 `koanf:"sampling-rate"`
+	// Admin settings
+	SettingsPath string `koanf:"settings"`
 	// TLS config
 	TLSCertPath string `koanf:"tls-cert-path"`
 	TLSKeyPath  string `koanf:"tls-key-path"`
@@ -127,23 +159,16 @@ func (c *Config) warnRedundantThemeDefaults() {
 	}
 }
 
-func (c *Config) Validate() error {
-	if err := c.validateAppName(); err != nil {
-		return err
-	}
-
-	if !c.InCluster && !c.OidcUseCookie && (c.OidcClientID != "" || c.OidcClientSecret != "" || c.OidcIdpIssuerURL != "" ||
-		c.OidcValidatorClientID != "" || c.OidcValidatorIdpIssuerURL != "") {
+// validateOIDC rejects OIDC flags outside in-cluster mode, cookie mode and cluster
+// discovery, and validates the OIDC CA file and API proxy settings.
+func (c *Config) validateOIDC() error {
+	if !c.InCluster && !c.OidcUseCookie && !c.discoveryEnabled() &&
+		(c.OidcClientID != "" || c.OidcClientSecret != "" || c.OidcIdpIssuerURL != "" ||
+			c.OidcValidatorClientID != "" || c.OidcValidatorIdpIssuerURL != "") {
 		return errors.New("oidc-client-id, oidc-client-secret, oidc-idp-issuer-url, " +
 			"oidc-validator-client-id, oidc-validator-idp-issuer-url, flags are only " +
-			"meant to be used in inCluster mode or with --oidc-use-cookie")
-	}
-
-	// Extracted to keep Validate's cognitive complexity within the linter limit.
-	c.warnRedundantThemeDefaults()
-
-	if err := c.validateServiceAccountTokenFlags(); err != nil {
-		return err
+			"meant to be used in inCluster mode, with --oidc-use-cookie, or with " +
+			"enabled cluster discovery")
 	}
 
 	// OIDC TLS verification warning.
@@ -152,6 +177,60 @@ func (c *Config) Validate() error {
 	}
 
 	if err := c.validateOIDCCAFile(); err != nil {
+		return err
+	}
+
+	return c.validateAPIProxy()
+}
+
+// validateAPIProxy validates the oidc-api-proxy-* configuration options.
+func (c *Config) validateAPIProxy() error {
+	if c.OidcAPIProxy != "" {
+		proxyURL, err := url.Parse(c.OidcAPIProxy)
+		if err != nil || proxyURL.Host == "" || (proxyURL.Scheme != "http" && proxyURL.Scheme != "https") {
+			return errors.New("oidc-api-proxy must be a valid http(s) URL")
+		}
+
+		if c.OidcClientID == "" || c.OidcIdpIssuerURL == "" {
+			return errors.New("oidc-api-proxy requires oidc-client-id and oidc-idp-issuer-url to be set")
+		}
+
+		// The api-proxy transport authenticates with the user's OIDC token
+		// only; it never carries the service account token.
+		if c.UnsafeUseServiceAccountToken {
+			return errors.New("oidc-api-proxy cannot be used together with unsafe-use-service-account-token")
+		}
+	}
+
+	if err := validateCAFile(c.OidcAPIProxyCAFile, "oidc-api-proxy-ca-file"); err != nil {
+		return err
+	}
+
+	if c.OidcAPIProxySkipTLSVerify {
+		logger.Log(logger.LevelWarn, nil, nil,
+			"oidc-api-proxy-skip-tls-verify is set, this is not safe for production")
+	}
+
+	return nil
+}
+
+func (c *Config) Validate() error {
+	if err := c.validateOptionValues(); err != nil {
+		return err
+	}
+
+	if err := c.validateAppName(); err != nil {
+		return err
+	}
+
+	if err := c.validateOIDC(); err != nil {
+		return err
+	}
+
+	// Extracted to keep Validate's cognitive complexity within the linter limit.
+	c.warnRedundantThemeDefaults()
+
+	if err := c.validateServiceAccountTokenFlags(); err != nil {
 		return err
 	}
 
@@ -189,6 +268,10 @@ func (c *Config) Validate() error {
 		return err
 	}
 
+	if err := c.validateDiscoverySources(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -205,56 +288,69 @@ func (c *Config) validateAppName() error {
 }
 
 func (c *Config) validateOIDCCAFile() error {
-	if c.OidcCAFile == "" {
+	return validateCAFile(c.OidcCAFile, "oidc-ca-file")
+}
+
+// validateCAFile checks that the given path, when set, points to a readable
+// file containing at least one PEM-encoded CA certificate. flagName is used
+// in error messages.
+func validateCAFile(path, flagName string) error {
+	if path == "" {
 		return nil
 	}
 
-	caFileContents, err := os.ReadFile(c.OidcCAFile)
+	caFileContents, err := os.ReadFile(path) //nolint:gosec // path comes from a CLI flag set by the operator
 	if err != nil {
-		return fmt.Errorf("error reading oidc-ca-file: %w", err)
+		return fmt.Errorf("error reading %s: %w", flagName, err)
 	}
 
 	caCertPool := x509.NewCertPool()
 	if !caCertPool.AppendCertsFromPEM(caFileContents) {
-		return errors.New("invalid oidc-ca-file")
+		return fmt.Errorf("invalid %s", flagName)
+	}
+
+	return nil
+}
+
+func readSecretFromFile(path string) (string, error) {
+	data, err := os.ReadFile(path) //nolint:gosec // credential path is configured by the operator
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(data)), nil
+}
+
+func (c *Config) loadOIDCSecretFiles(explicitFlags map[string]bool) error {
+	// Explicit direct flags take precedence, so skip reading the file entirely.
+	if c.OidcClientIDFile != "" && !explicitFlags["oidc-client-id"] {
+		clientID, err := readSecretFromFile(c.OidcClientIDFile)
+		if err != nil {
+			return fmt.Errorf("error reading oidc-client-id-file: %w", err)
+		}
+
+		if clientID == "" {
+			return errors.New("oidc-client-id-file must contain a non-empty client ID")
+		}
+
+		c.OidcClientID = clientID
+	}
+
+	if c.OidcClientSecretFile != "" && !explicitFlags["oidc-client-secret"] {
+		clientSecret, err := readSecretFromFile(c.OidcClientSecretFile)
+		if err != nil {
+			return fmt.Errorf("error reading oidc-client-secret-file: %w", err)
+		}
+
+		c.OidcClientSecret = clientSecret
 	}
 
 	return nil
 }
 
 func (c *Config) validateClusterInventory() error {
-	if !c.EnableClusterInventory {
-		return nil
-	}
-
-	if c.ClusterInventoryProviderFile == "" {
-		return errors.New("cluster-inventory-provider-file is required when cluster inventory is enabled")
-	}
-
-	info, err := os.Stat(c.ClusterInventoryProviderFile)
-	if err != nil {
-		return fmt.Errorf("error reading cluster-inventory-provider-file: %w", err)
-	}
-
-	if !info.Mode().IsRegular() {
-		return errors.New("cluster-inventory-provider-file must be a regular file")
-	}
-
-	if _, err := access.NewFromFile(c.ClusterInventoryProviderFile); err != nil {
-		return fmt.Errorf("invalid cluster-inventory-provider-file: %w", err)
-	}
-
-	labelSelector := strings.TrimSpace(c.ClusterInventoryLabelSelector)
-	if labelSelector != "" {
-		if _, err := labels.Parse(labelSelector); err != nil {
-			return fmt.Errorf("invalid cluster-inventory-label-selector: %w", err)
-		}
-	}
-
-	c.ClusterInventoryLabelSelector = labelSelector
-
-	if err := clusterinventory.ValidateNamespaces(c.ClusterInventoryNamespaces); err != nil {
-		return err
+	if c.ClusterInventoryProviderFile != "" {
+		return errors.New("cluster-inventory-provider-file is no longer supported; Cluster Inventory requires per-user OIDC")
 	}
 
 	return nil
@@ -269,6 +365,43 @@ func (c *Config) validateServiceAccountTokenFlags() error {
 	if c.ServiceAccountTokenPath != "" && !c.UnsafeUseServiceAccountToken {
 		return errors.New("--service-account-token-path requires " +
 			"--unsafe-use-service-account-token to be enabled")
+	}
+
+	return nil
+}
+
+func (c *Config) validateOptionValues() error {
+	if c.Port == 0 || c.Port > maxPort {
+		return fmt.Errorf("port must be between 1 and %d", maxPort)
+	}
+
+	if !isValidLogLevel(c.LogLevel) {
+		return errors.New("log-level must be one of debug, info, warn, or error")
+	}
+
+	return validateTLSPaths(c.TLSCertPath, c.TLSKeyPath)
+}
+
+func isValidLogLevel(logLevel string) bool {
+	switch strings.ToLower(strings.TrimSpace(logLevel)) {
+	case "", "debug", "info", "warn", "error":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateTLSPaths(certPath, keyPath string) error {
+	if certPath == "" && keyPath == "" {
+		return nil
+	}
+
+	if certPath == "" || keyPath == "" {
+		return errors.New("tls-cert-path and tls-key-path must be configured together")
+	}
+
+	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
+		return fmt.Errorf("invalid tls certificate or key path: %w", err)
 	}
 
 	return nil
@@ -313,6 +446,11 @@ func recordExplicitFlags(f *flag.FlagSet) map[string]bool {
 	})
 
 	return explicitFlags
+}
+
+func hasWatchPluginsChangesEnv() bool {
+	_, ok := os.LookupEnv("HEADLAMP_CONFIG_WATCH_PLUGINS_CHANGES")
+	return ok
 }
 
 // loadConfigFromEnv loads config values from environment variables into koanf.
@@ -459,11 +597,11 @@ func ParseWithAppNameDefault(args []string, appName string) (*Config, error) {
 	explicitFlags := recordExplicitFlags(f)
 
 	// 4. Load config from environment variables.
-	_, watchPluginsChangesEnvSet := os.LookupEnv("HEADLAMP_CONFIG_WATCH_PLUGINS_CHANGES")
-
 	if err := loadConfigFromEnv(k); err != nil {
 		return nil, err
 	}
+
+	watchPluginsChangesEnvSet := hasWatchPluginsChangesEnv()
 
 	// 5. Reload explicitly-set flags to override env values.
 	if err := reloadExplicitFlags(k, f, explicitFlags); err != nil {
@@ -475,10 +613,17 @@ func ParseWithAppNameDefault(args []string, appName string) (*Config, error) {
 		return nil, err
 	}
 
+	config.loadDiscoverySettings(k)
+
 	// 7. Post-process: patch plugin flag and kubeconfig path.
 	patchWatchPluginsChanges(&config, explicitFlags, watchPluginsChangesEnvSet)
 
 	if err := setKubeConfigPath(&config); err != nil {
+		return nil, err
+	}
+
+	if err := config.loadOIDCSecretFiles(explicitFlags); err != nil {
+		logger.Log(logger.LevelError, nil, err, "reading OIDC secret files")
 		return nil, err
 	}
 
@@ -632,19 +777,10 @@ func addGeneralFlags(f *flag.FlagSet, appName string) {
 	f.String("listen-addr", "", "Address to listen on; default is empty, which means listening to any address")
 	f.Uint("port", defaultPort, "Port to listen from")
 	f.String("proxy-urls", "", "Allow proxy requests to specified URLs")
+	f.String("backstage-origin", "",
+		"Comma-separated list of trusted Backstage origins for postMessage integration")
 	f.Bool("enable-helm", false, "Enable Helm operations")
-	f.Bool("enable-cluster-inventory", false,
-		"Enable experimental/alpha automatic discovery of clusters from ClusterProfile resources")
-	f.String("cluster-inventory-provider-file", "",
-		"Path to the JSON configuration file for experimental/alpha Cluster Inventory access providers")
-	f.String("cluster-inventory-label-selector", "",
-		"Label selector used to filter ClusterProfile resources for experimental/alpha Cluster Inventory")
-	f.String("cluster-inventory-namespaces", "",
-		"Comma-separated namespaces watched for experimental/alpha ClusterProfile resources; \"*\" watches all")
-	f.Duration("cluster-inventory-root-reconcile-interval", clusterinventory.DefaultRootReconcileInterval,
-		"Interval for reconciling experimental/alpha Cluster Inventory roots")
-	f.Duration("cluster-inventory-no-crd-cache-ttl", clusterinventory.DefaultNoCRDCacheTTL,
-		"How long to cache that an API server has no experimental/alpha ClusterProfile CRD")
+	addClusterDiscoveryFlags(f)
 	f.String("default-light-theme", "", "Default theme to use when user prefers light mode")
 	f.String("default-dark-theme", "", "Default theme to use when user prefers dark mode")
 	f.String("force-theme", "", "Force a specific theme, overriding user preferences")
@@ -654,12 +790,15 @@ func addGeneralFlags(f *flag.FlagSet, appName string) {
 	f.String("service-account-token-path", "",
 		"Path to the service account token. "+
 			"Only used when --unsafe-use-service-account-token is set and in-cluster")
+	f.String("settings", "", "Path to admin settings JSON file")
 }
 
 func addOIDCFlags(f *flag.FlagSet) {
 	f.Bool("oidc-auto-login", false, "Automatic Redirect to OIDC provider")
 	f.String("oidc-client-id", "", "ClientID for OIDC")
+	f.String("oidc-client-id-file", "", "Path to file containing ClientID for OIDC")
 	f.String("oidc-client-secret", "", "ClientSecret for OIDC")
+	f.String("oidc-client-secret-file", "", "Path to file containing ClientSecret for OIDC")
 	f.String("oidc-validator-client-id", "", "Override ClientID for OIDC during validation")
 	f.String("oidc-idp-issuer-url", "", "Identity provider issuer URL for OIDC")
 	f.String("oidc-callback-url", "", "OIDC callback URL and trusted logout return origin")
@@ -668,6 +807,14 @@ func addOIDCFlags(f *flag.FlagSet) {
 	f.Bool("oidc-skip-tls-verify", false, "Skip TLS verification for OIDC")
 	f.Bool("oidc-skip-logout", false, "Skip logout from OIDC provider")
 	f.String("oidc-ca-file", "", "CA file for OIDC")
+	f.String("oidc-api-proxy", "",
+		"URL of an external Kubernetes API proxy. When set, "+
+			"all Kubernetes API requests are routed through this URL instead of "+
+			"the kube-apiserver. The OIDC bearer token is forwarded as-is.")
+	f.String("oidc-api-proxy-ca-file", "",
+		"PEM-encoded CA file used to verify the TLS certificate of the api-proxy")
+	f.Bool("oidc-api-proxy-skip-tls-verify", false,
+		"Skip TLS verification for the api-proxy connection (testing only)")
 	f.Bool("oidc-use-access-token", false, "Setup oidc to pass through the access_token instead of the default id_token")
 	f.Bool("oidc-use-cookie", false, "Enable OIDC cookie usage even when not running in-cluster")
 	f.Bool("oidc-use-token-broadcast", false,
@@ -787,4 +934,79 @@ func GetDefaultKubeConfigPath() (string, error) {
 	}
 
 	return filepath.Join(homeDirectory, ".kube", "config"), nil
+}
+
+// loadDiscoverySettings reads the flags of every built-in discovery source into DiscoverySources.
+func (c *Config) loadDiscoverySettings(k *koanf.Koanf) {
+	c.DiscoverySources = make(map[string]clusterdiscovery.Settings)
+
+	for _, source := range clusterdiscovery.BuiltinSources().Sources() {
+		d := source.Descriptor()
+		prefix := d.FlagPrefix()
+		c.DiscoverySources[d.ID] = clusterdiscovery.Settings{
+			Enabled:               k.Bool("enable-" + prefix),
+			Namespaces:            k.String(prefix + "-namespaces"),
+			LabelSelector:         strings.TrimSpace(k.String(prefix + "-label-selector")),
+			RootReconcileInterval: k.Duration(prefix + "-root-reconcile-interval"),
+			NoCRDCacheTTL:         k.Duration(prefix + "-no-crd-cache-ttl"),
+		}
+	}
+}
+
+// discoveryEnabled reports whether any discovery source is enabled.
+func (c *Config) discoveryEnabled() bool {
+	for _, settings := range c.DiscoverySources {
+		if settings.Enabled {
+			return true
+		}
+	}
+
+	return false
+}
+
+// validateDiscoverySources checks the OIDC settings, namespaces and label selector of
+// every enabled discovery source.
+func (c *Config) validateDiscoverySources() error {
+	for id, settings := range c.DiscoverySources {
+		if !settings.Enabled {
+			continue
+		}
+
+		if err := clusterdiscovery.ValidateOIDC(c.OidcClientID, c.OidcIdpIssuerURL,
+			strings.Split(c.OidcScopes, ",")); err != nil {
+			return fmt.Errorf("%s: %w", id, err)
+		}
+
+		prefix := clusterdiscovery.Descriptor{ID: id}.FlagPrefix()
+
+		if err := clusterdiscovery.ValidateNamespaces(settings.Namespaces); err != nil {
+			return fmt.Errorf("%s-namespaces: %w", prefix, err)
+		}
+
+		if _, err := labels.Parse(settings.LabelSelector); err != nil {
+			return fmt.Errorf("invalid %s-label-selector: %w", prefix, err)
+		}
+	}
+
+	return nil
+}
+
+// addClusterDiscoveryFlags registers the flags of every built-in discovery source. It
+// keeps the removed provider-file flag, so that using it is reported as unsupported.
+func addClusterDiscoveryFlags(f *flag.FlagSet) {
+	for _, source := range clusterdiscovery.BuiltinSources().Sources() {
+		d := source.Descriptor()
+		prefix := d.FlagPrefix()
+		f.Bool("enable-"+prefix, false, "Discover "+d.DisplayName+" connections with per-user OIDC")
+		f.String(prefix+"-namespaces", "",
+			"Namespaces watched for "+d.DisplayName+"; empty uses each root default, * watches all")
+		f.String(prefix+"-label-selector", "", "Label selector for "+d.DisplayName+" resources")
+		f.Duration(prefix+"-root-reconcile-interval", clusterdiscovery.DefaultRootReconcileInterval,
+			"Interval for reconciling "+d.DisplayName+" roots")
+		f.Duration(prefix+"-no-crd-cache-ttl", clusterdiscovery.DefaultNoCRDCacheTTL,
+			"How long to cache that an API server has no "+d.DisplayName+" CRD")
+	}
+
+	f.String("cluster-inventory-provider-file", "",
+		"Removed: Cluster Inventory requires per-user OIDC; provider files are no longer supported")
 }

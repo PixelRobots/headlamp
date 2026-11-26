@@ -1,3 +1,19 @@
+/*
+ * Copyright 2025 The Kubernetes Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 import { Octokit } from '@octokit/rest';
 import chalk from 'chalk';
 import * as semver from 'semver';
@@ -100,9 +116,19 @@ export async function checkArtifactsForRelease(releaseDraft: GitHubRelease): Pro
     `Headlamp-${releaseVersion}-linux-armv7l.tar.gz`,
     `Headlamp-${releaseVersion}-linux-x64.tar.gz`,
     `Headlamp-${releaseVersion}-win-x64.exe`,
+    `Headlamp-${releaseVersion}-win-arm64.exe`,
     `headlamp_${releaseVersion}-1_amd64.deb`,
     `checksums.txt`,
-    `checksums.txt.sigstore.json`
+    `checksums.txt.sigstore.json`,
+    `headlamp-${releaseVersion}.intoto.jsonl`
+  ];
+
+  // Optional assets: known/expected but not required for a release to be considered ready.
+  // Currently the MSI installer is built alongside the win-x64/arm64 .exe installers, but we
+  // don't yet require it for every release, so it's tracked here instead of requiredAssets.
+  const optionalAssets = [
+    `Headlamp-${releaseVersion}-win-x64.msi`,
+    `Headlamp-${releaseVersion}-win-arm64.msi`
   ];
 
   const assets = releaseDraft.assets || [];
@@ -110,11 +136,17 @@ export async function checkArtifactsForRelease(releaseDraft: GitHubRelease): Pro
   requiredAssets.forEach(asset => {
     foundAssets[asset] = false;
   });
+  const foundOptionalAssets: Record<string, boolean> = {};
+  optionalAssets.forEach(asset => {
+    foundOptionalAssets[asset] = false;
+  });
   const unknownAssets: string[] = [];
 
   assets.forEach((asset: ReleaseAsset) => {
-    if (foundAssets.hasOwnProperty(asset.name)) {
+    if (Object.prototype.hasOwnProperty.call(foundAssets, asset.name)) {
       foundAssets[asset.name] = true;
+    } else if (Object.prototype.hasOwnProperty.call(foundOptionalAssets, asset.name)) {
+      foundOptionalAssets[asset.name] = true;
     } else {
       unknownAssets.push(asset.name);
     }
@@ -127,6 +159,14 @@ export async function checkArtifactsForRelease(releaseDraft: GitHubRelease): Pro
     } else {
       console.error(chalk.red(`❌ Missing asset: ${assetName}`));
       allFound = false;
+    }
+  });
+
+  Object.entries(foundOptionalAssets).forEach(([assetName, found]) => {
+    if (found) {
+      console.log(chalk.green(`✅ Found optional asset: ${assetName}`));
+    } else {
+      console.log(chalk.gray(`ℹ️  Optional asset not present: ${assetName}`));
     }
   });
 

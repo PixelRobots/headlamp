@@ -16,7 +16,6 @@
 
 import React from 'react';
 import { useHistory } from 'react-router';
-import NotFoundComponent from '../../components/404';
 import AuthToken from '../../components/account/Auth';
 import AddCluster from '../../components/App/CreateCluster/AddCluster';
 import Home from '../../components/App/Home';
@@ -46,6 +45,8 @@ import ResourceClaimDetails from '../../components/device/ResourceClaimDetails';
 import ResourceClaimList from '../../components/device/ResourceClaimList';
 import ResourceClaimTemplateDetails from '../../components/device/ResourceClaimTemplateDetails';
 import ResourceClaimTemplateList from '../../components/device/ResourceClaimTemplateList';
+import ResourceSliceDetails from '../../components/device/ResourceSliceDetails';
+import ResourceSliceList from '../../components/device/ResourceSliceList';
 import EndpointDetails from '../../components/endpoints/Details';
 import EndpointList from '../../components/endpoints/List';
 import EndpointSliceDetails from '../../components/endpointSlices/Details';
@@ -82,6 +83,10 @@ import { LeaseDetails } from '../../components/lease/Details';
 import { LeaseList } from '../../components/lease/List';
 import { LimitRangeDetails } from '../../components/limitRange/Details';
 import { LimitRangeList } from '../../components/limitRange/List';
+import MutatingAdmissionPolicyDetails from '../../components/mutatingAdmissionPolicy/Details';
+import MutatingAdmissionPolicyList from '../../components/mutatingAdmissionPolicy/List';
+import MutatingAdmissionPolicyBindingDetails from '../../components/mutatingAdmissionPolicyBinding/Details';
+import MutatingAdmissionPolicyBindingList from '../../components/mutatingAdmissionPolicyBinding/List';
 import NamespaceDetails from '../../components/namespace/Details';
 import NamespacesList from '../../components/namespace/List';
 import { NetworkPolicyDetails } from '../../components/networkpolicy/Details';
@@ -115,7 +120,7 @@ import ServiceDetails from '../../components/service/Details';
 import ServiceList from '../../components/service/List';
 import ServiceAccountDetails from '../../components/serviceaccount/Details';
 import ServiceAccountList from '../../components/serviceaccount/List';
-import { DefaultSidebars } from '../../components/Sidebar';
+import { DefaultSidebars } from '../../components/Sidebar/sidebarSlice';
 import StatefulSetList from '../../components/statefulset/List';
 import PersistentVolumeClaimDetails from '../../components/storage/ClaimDetails';
 import PersistentVolumeClaimList from '../../components/storage/ClaimList';
@@ -682,8 +687,9 @@ const defaultRoutes: { [routeName: string]: Route } = {
     component: () => <RoleDetails />,
   },
   clusterRoles: {
-    path: '/roles',
+    path: '/clusterroles',
     exact: true,
+    name: 'Roles',
     sidebar: 'roles',
     component: () => <RoleList />,
   },
@@ -709,10 +715,10 @@ const defaultRoutes: { [routeName: string]: Route } = {
     component: () => <RoleBindingDetails />,
   },
   clusterRoleBindings: {
-    path: '/rolebindings',
+    path: '/clusterrolebindings',
     exact: true,
     sidebar: 'roleBindings',
-    component: () => <RoleBindingDetails />,
+    component: () => <RoleBindingList />,
   },
   secrets: {
     path: '/secrets',
@@ -841,6 +847,20 @@ const defaultRoutes: { [routeName: string]: Route } = {
     sidebar: 'resourceClaimTemplates',
     component: () => <ResourceClaimTemplateDetails />,
   },
+  resourceslices: {
+    path: '/resourceslices',
+    exact: true,
+    name: 'Resource Slices',
+    sidebar: 'resourceSlices',
+    component: () => <ResourceSliceList />,
+  },
+  resourceSlice: {
+    path: '/resourceslices/:name',
+    exact: true,
+    name: 'Resource Slice',
+    sidebar: 'resourceSlices',
+    component: () => <ResourceSliceDetails />,
+  },
   priorityclasses: {
     path: '/priorityclasses',
     exact: true,
@@ -924,6 +944,34 @@ const defaultRoutes: { [routeName: string]: Route } = {
     name: 'Mutating Webhook Configuration',
     sidebar: 'mutatingWebhookConfigurations',
     component: () => <MutatingWebhookConfigurationDetails />,
+  },
+  mutatingAdmissionPolicies: {
+    path: '/mutatingadmissionpolicies',
+    exact: true,
+    name: 'Mutating Admission Policies',
+    sidebar: 'mutatingAdmissionPolicies',
+    component: () => <MutatingAdmissionPolicyList />,
+  },
+  mutatingAdmissionPolicy: {
+    path: '/mutatingadmissionpolicies/:name',
+    exact: true,
+    name: 'Mutating Admission Policy',
+    sidebar: 'mutatingAdmissionPolicies',
+    component: () => <MutatingAdmissionPolicyDetails />,
+  },
+  mutatingAdmissionPolicyBindings: {
+    path: '/mutatingadmissionpolicybindings',
+    exact: true,
+    name: 'Mutating Admission Policy Bindings',
+    sidebar: 'mutatingAdmissionPolicyBindings',
+    component: () => <MutatingAdmissionPolicyBindingList />,
+  },
+  mutatingAdmissionPolicyBinding: {
+    path: '/mutatingadmissionpolicybindings/:name',
+    exact: true,
+    name: 'Mutating Admission Policy Binding',
+    sidebar: 'mutatingAdmissionPolicyBindings',
+    component: () => <MutatingAdmissionPolicyBindingDetails />,
   },
   validatingWebhookConfigurations: {
     path: '/validatingwebhookconfigurations',
@@ -1170,14 +1218,4 @@ const defaultRoutes: { [routeName: string]: Route } = {
 
 setDefaultRoutes(defaultRoutes);
 
-// The NotFound route  needs to be considered always in the last place when used
-// with the router switch, as any routes added after this one will never be considered.
-// So we do not include it in the default routes in order to always "manually" consider it.
-export const NotFoundRoute = {
-  path: '*',
-  exact: true,
-  name: `Whoops! This page doesn't exist`,
-  component: () => <NotFoundComponent />,
-  sidebar: null,
-  noAuthRequired: true,
-};
+export { NotFoundRoute } from './notFoundRoute';

@@ -17,11 +17,16 @@
 import { useMemo } from 'react';
 import BackendTLSPolicy from '../../../../lib/k8s/backendTLSPolicy';
 import BackendTrafficPolicy from '../../../../lib/k8s/backendTrafficPolicy';
+import type { LabelSelector } from '../../../../lib/k8s/cluster';
+import ClusterRole from '../../../../lib/k8s/clusterRole';
+import ClusterRoleBinding from '../../../../lib/k8s/clusterRoleBinding';
+import CompositePodGroup from '../../../../lib/k8s/compositePodGroup';
 import ConfigMap from '../../../../lib/k8s/configMap';
 import CustomResourceDefinition from '../../../../lib/k8s/crd';
 import CronJob from '../../../../lib/k8s/cronJob';
 import DaemonSet from '../../../../lib/k8s/daemonSet';
 import Deployment from '../../../../lib/k8s/deployment';
+import DeviceClass from '../../../../lib/k8s/deviceClass';
 import Endpoints from '../../../../lib/k8s/endpoints';
 import EndpointSlice from '../../../../lib/k8s/endpointSlices';
 import Gateway from '../../../../lib/k8s/gateway';
@@ -41,9 +46,13 @@ import MutatingWebhookConfiguration from '../../../../lib/k8s/mutatingWebhookCon
 import NetworkPolicy from '../../../../lib/k8s/networkpolicy';
 import PersistentVolumeClaim from '../../../../lib/k8s/persistentVolumeClaim';
 import Pod from '../../../../lib/k8s/pod';
+import PodGroup from '../../../../lib/k8s/podGroup';
 import ReplicaSet from '../../../../lib/k8s/replicaSet';
+import ResourceClaim from '../../../../lib/k8s/resourceClaim';
+import ResourceClaimTemplate from '../../../../lib/k8s/resourceClaimTemplate';
 import Role from '../../../../lib/k8s/role';
 import RoleBinding from '../../../../lib/k8s/roleBinding';
+import SchedulingWorkload from '../../../../lib/k8s/schedulingWorkload';
 import Secret from '../../../../lib/k8s/secret';
 import Service from '../../../../lib/k8s/service';
 import ServiceAccount from '../../../../lib/k8s/serviceAccount';
@@ -54,7 +63,7 @@ import ValidatingWebhookConfiguration from '../../../../lib/k8s/validatingWebhoo
 import { useNamespaces } from '../../../../redux/filterSlice';
 import { useTypedSelector } from '../../../../redux/hooks';
 import { GraphEdge, GraphNode, Relation } from '../../graph/graphModel';
-import { makeKubeSourceId } from './graphDefinitionUtils';
+import { makeCRSourceId, makeKubeSourceId } from './graphDefinitionUtils';
 import { BUILT_IN_RELATION_IDS } from './relationIds';
 
 /**
@@ -66,6 +75,40 @@ export const matchesLabels = (matchLabels: Record<string, string>, item: KubeObj
     item.metadata.labels &&
     Object.entries(matchLabels).every(([key, value]) => item.metadata?.labels?.[key] === value)
   );
+};
+
+/**
+ * Check if the given item is selected by a Kubernetes label selector.
+ * An empty selector selects every item.
+ */
+export const matchesLabelSelector = (selector: LabelSelector | undefined, item: KubeObject) => {
+  if (!selector) {
+    return false;
+  }
+  const labels = item.metadata.labels ?? {};
+  const hasLabel = (key: string) => Object.prototype.hasOwnProperty.call(labels, key);
+
+  const labelsMatch = Object.entries(selector.matchLabels ?? {}).every(
+    ([key, value]) => hasLabel(key) && labels[key] === value
+  );
+  if (!labelsMatch) {
+    return false;
+  }
+
+  return (selector.matchExpressions ?? []).every(({ key, operator, values = [] }) => {
+    switch (operator) {
+      case 'In':
+        return hasLabel(key) && values.includes(labels[key]);
+      case 'NotIn':
+        return !hasLabel(key) || !values.includes(labels[key]);
+      case 'Exists':
+        return hasLabel(key);
+      case 'DoesNotExist':
+        return !hasLabel(key);
+      default:
+        return false;
+    }
+  });
 };
 
 const makeRelation = <From extends KubeObjectClass, To extends KubeObjectClass>(
@@ -133,9 +176,12 @@ const makeOwnerRelation = (cl: KubeObjectClass): Relation => ({
   },
 });
 
-const makeOwnerRelationReversed = (cl: KubeObjectClass): Relation => ({
-  id: `owner-reversed-${makeKubeSourceId(cl)}`,
-  fromSource: makeKubeSourceId(cl),
+const makeOwnerRelationReversed = (
+  cl: KubeObjectClass,
+  sourceId: string = makeKubeSourceId(cl)
+): Relation => ({
+  id: `owner-reversed-${sourceId}`,
+  fromSource: sourceId,
   predicate(from, to) {
     const obj = to.kubeObject as KubeObject;
 
@@ -174,6 +220,68 @@ const makeOwnerRelationReversed = (cl: KubeObjectClass): Relation => ({
     return edges;
   },
 });
+
+/**
+ * Create a relation whose source names its targets, such as a Pod naming its claims.
+ *
+ * The edges come from one lookup per name instead of comparing every pair of nodes, so
+ * the cost grows with the number of nodes rather than with their product.
+ * @param id - The id of the relation.
+ * @param from - The class of the objects that name their targets.
+ * @param to - The class of the named objects.
+ * @param targetNames - The names an object refers to, in its own namespace when `to` is
+ * namespaced.
+ * @param edgeAttributes - Extra attributes for every edge of the relation.
+ */
+const makeNamedRelation = <From extends KubeObjectClass>(
+  id: string,
+  from: From,
+  to: KubeObjectClass,
+  targetNames: (object: InstanceType<From>) => string[],
+  edgeAttributes: Partial<Omit<GraphEdge, 'id' | 'source' | 'target'>> = {}
+): Relation => {
+  const targetKey = (object: KubeObject, name: string) =>
+    JSON.stringify([object.cluster, to.isNamespaced ? object.metadata.namespace : '', name]);
+
+  return {
+    id,
+    fromSource: makeKubeSourceId(from),
+    toSource: makeKubeSourceId(to),
+    predicate(fromNode, toNode) {
+      const source = fromNode.kubeObject as InstanceType<From>;
+      const target = toNode.kubeObject as KubeObject;
+      return targetNames(source).some(
+        name => targetKey(source, name) === targetKey(target, target.metadata.name)
+      );
+    },
+    edgeAttributes: () => edgeAttributes,
+    buildEdgesWithIndex(fromNodes, nodesByUid) {
+      const targetsByKey = new Map<string, GraphNode>();
+      for (const node of nodesByUid.values()) {
+        if (node.kubeObject && to.isClassOf(node.kubeObject)) {
+          targetsByKey.set(targetKey(node.kubeObject, node.kubeObject.metadata.name), node);
+        }
+      }
+
+      const edges: GraphEdge[] = [];
+      for (const fromNode of fromNodes) {
+        const source = fromNode.kubeObject as InstanceType<From>;
+        for (const name of new Set(targetNames(source))) {
+          const toNode = targetsByKey.get(targetKey(source, name));
+          if (toNode) {
+            edges.push({
+              ...edgeAttributes,
+              id: `${fromNode.id}-${toNode.id}-${id}`,
+              source: fromNode.id,
+              target: toNode.id,
+            });
+          }
+        }
+      }
+      return edges;
+    },
+  };
+};
 
 const configMapUsedInPods = makeRelation('pod-configmap', Pod, ConfigMap, (pod, configMap) =>
   pod.spec.volumes?.find(volume => volume.configMap?.name === configMap.metadata.name)
@@ -269,14 +377,29 @@ const ingressToSecret = makeRelation('ingress-secret', Ingress, Secret, (ingress
 );
 
 const networkPolicyToPod = makeRelation('networkpolicy-pod', NetworkPolicy, Pod, (np, pod) =>
-  matchesLabels(np.spec.podSelector.matchLabels ?? {}, pod)
+  matchesLabelSelector(np.spec.podSelector, pod)
 );
 
+// roleRef.kind decides which of the two kinds the name refers to, so it has to be
+// part of the match. Without it a binding that grants a ClusterRole would also draw
+// an edge to any namespaced Role sharing that name, and vice versa.
 const roleBindingsToRole = makeRelation(
   'rolebinding-role',
   RoleBinding,
   Role,
-  (binding, role) => role.metadata.name === binding.roleRef.name
+  (binding, role) => binding.roleRef.kind === 'Role' && role.metadata.name === binding.roleRef.name
+);
+
+// Granting a ClusterRole inside a single namespace is how the built-in view, edit
+// and admin roles are usually handed out, so this is the common way a RoleBinding
+// reaches a ClusterRole. makeRelation skips its shared namespace check here because
+// the ClusterRole is cluster scoped.
+const roleBindingToClusterRole = makeRelation(
+  'rolebinding-clusterrole',
+  RoleBinding,
+  ClusterRole,
+  (binding, clusterRole) =>
+    binding.roleRef.kind === 'ClusterRole' && clusterRole.metadata.name === binding.roleRef.name
 );
 
 const roleBindingToServiceAccount = makeRelation(
@@ -286,6 +409,26 @@ const roleBindingToServiceAccount = makeRelation(
   (binding, sa) =>
     binding.subjects.find(
       subject => subject.kind === 'ServiceAccount' && sa.metadata.name === subject.name
+    )
+);
+
+const clusterRoleBindingToClusterRole = makeRelation(
+  'clusterrolebinding-clusterrole',
+  ClusterRoleBinding,
+  ClusterRole,
+  (binding, role) => role.metadata.name === binding.roleRef.name
+);
+
+const clusterRoleBindingToServiceAccount = makeRelation(
+  'clusterrolebinding-sa',
+  ClusterRoleBinding,
+  ServiceAccount,
+  (binding, sa) =>
+    binding.subjects?.find(
+      subject =>
+        subject.kind === 'ServiceAccount' &&
+        subject.name === sa.metadata.name &&
+        subject.namespace === sa.metadata.namespace
     )
 );
 
@@ -307,6 +450,15 @@ const serviceAccountToDaemonSets = makeRelation(
     ds.metadata.namespace === sa.metadata.namespace
 );
 
+const serviceAccountToStatefulSets = makeRelation(
+  'sa-statefulset',
+  ServiceAccount,
+  StatefulSet,
+  (sa, statefulSet) =>
+    (statefulSet.spec?.template?.spec?.serviceAccountName ?? 'default') === sa.metadata.name &&
+    statefulSet.metadata.namespace === sa.metadata.namespace
+);
+
 const pvcToPods = makeRelation(
   'pvc-pod',
   PersistentVolumeClaim,
@@ -319,6 +471,37 @@ const pvcToPods = makeRelation(
   // eslint-disable-next-line no-unused-vars
   (pvc, _pod) =>
     pvc.spec?.accessModes?.includes('ReadWriteMany') ? { nonGroupingSide: 'source' } : {}
+);
+
+const podToResourceClaim = makeNamedRelation('pod-resourceclaim', Pod, ResourceClaim, pod =>
+  pod.resourceClaims.flatMap(claim => (claim.claimName ? [claim.claimName] : []))
+);
+
+const podToResourceClaimTemplate = makeNamedRelation(
+  'pod-resourceclaimtemplate',
+  Pod,
+  ResourceClaimTemplate,
+  pod => pod.resourceClaims.flatMap(claim => (claim.templateName ? [claim.templateName] : [])),
+  { nonGroupingSide: 'target' }
+);
+
+// Every claim for the same kind of device names one device class, and Pods of unrelated
+// workloads can share one template, so splitting them out keeps them from merging all of
+// those workloads into a single group.
+const resourceClaimToDeviceClass = makeNamedRelation(
+  'resourceclaim-deviceclass',
+  ResourceClaim,
+  DeviceClass,
+  claim => claim.requestedClasses,
+  { nonGroupingSide: 'target' }
+);
+
+const resourceClaimTemplateToDeviceClass = makeNamedRelation(
+  'resourceclaimtemplate-deviceclass',
+  ResourceClaimTemplate,
+  DeviceClass,
+  template => template.requestedClasses,
+  { nonGroupingSide: 'both' }
 );
 
 const podToOwner = makeOwnerRelation(Pod);
@@ -337,7 +520,12 @@ const useGetCRToOwnerRelations = () => {
         // CRD with incomplete spec; skip it (#4824).
         return [];
       }
-      return [makeOwnerRelationReversed(CRClass)];
+      // The Custom Resources group lists a CR under its prefixed id, while kinds the map
+      // already has built-in sources for (such as Gateway) keep the plain id.
+      return [
+        makeOwnerRelationReversed(CRClass),
+        makeOwnerRelationReversed(CRClass, makeCRSourceId(CRClass)),
+      ];
     });
   }, [crds]);
 };
@@ -372,32 +560,17 @@ const gatewayToGatewayClass = makeRelation(
   (gateway, gatewayClass) => gateway.spec?.gatewayClassName === gatewayClass.metadata.name
 );
 
-const httpRouteToGateway = makeRelation(
-  'httproute-gateway',
-  HTTPRoute,
-  Gateway,
-  (httpRoute, gateway) => httpRoute.spec.parentRefs?.find(ref => ref.name === gateway.metadata.name)
-);
+// HTTPRoute, TCPRoute and UDPRoute share the same parentRefs and backendRefs
+// semantics, including references to objects in other namespaces.
+type GatewayRoute = HTTPRoute | TCPRoute | UDPRoute;
+type GatewayRouteClass = typeof HTTPRoute | typeof TCPRoute | typeof UDPRoute;
 
-const httpRouteToService = makeRelation(
-  'httproute-service',
-  HTTPRoute,
-  Service,
-  (httpRoute, service) =>
-    httpRoute.spec.rules?.find(rule =>
-      rule.backendRefs?.find(backend => backend.name === service.metadata.name)
-    )
-);
-
-type L4Route = TCPRoute | UDPRoute;
-type L4RouteClass = typeof TCPRoute | typeof UDPRoute;
-
-const makeL4RouteToGatewayRelation = (id: string, RouteClass: L4RouteClass): Relation => ({
+const makeRouteToGatewayRelation = (id: string, RouteClass: GatewayRouteClass): Relation => ({
   id,
   fromSource: makeKubeSourceId(RouteClass),
   toSource: makeKubeSourceId(Gateway),
   predicate(fromNode, toNode) {
-    const route = fromNode.kubeObject as L4Route;
+    const route = fromNode.kubeObject as GatewayRoute;
     const gateway = toNode.kubeObject as Gateway;
 
     return (
@@ -417,12 +590,12 @@ const makeL4RouteToGatewayRelation = (id: string, RouteClass: L4RouteClass): Rel
   },
 });
 
-const makeL4RouteToServiceRelation = (id: string, RouteClass: L4RouteClass): Relation => ({
+const makeRouteToServiceRelation = (id: string, RouteClass: GatewayRouteClass): Relation => ({
   id,
   fromSource: makeKubeSourceId(RouteClass),
   toSource: makeKubeSourceId(Service),
   predicate(fromNode, toNode) {
-    const route = fromNode.kubeObject as L4Route;
+    const route = fromNode.kubeObject as GatewayRoute;
     const service = toNode.kubeObject as Service;
 
     return (
@@ -444,10 +617,54 @@ const makeL4RouteToServiceRelation = (id: string, RouteClass: L4RouteClass): Rel
   },
 });
 
-const tcpRouteToGateway = makeL4RouteToGatewayRelation('tcproute-gateway', TCPRoute);
-const tcpRouteToService = makeL4RouteToServiceRelation('tcproute-service', TCPRoute);
-const udpRouteToGateway = makeL4RouteToGatewayRelation('udproute-gateway', UDPRoute);
-const udpRouteToService = makeL4RouteToServiceRelation('udproute-service', UDPRoute);
+const httpRouteToGateway = makeRouteToGatewayRelation('httproute-gateway', HTTPRoute);
+const httpRouteToService = makeRouteToServiceRelation('httproute-service', HTTPRoute);
+const tcpRouteToGateway = makeRouteToGatewayRelation('tcproute-gateway', TCPRoute);
+const tcpRouteToService = makeRouteToServiceRelation('tcproute-service', TCPRoute);
+const udpRouteToGateway = makeRouteToGatewayRelation('udproute-gateway', UDPRoute);
+const udpRouteToService = makeRouteToServiceRelation('udproute-service', UDPRoute);
+
+// The scheduling API objects carry no owner references, so the hierarchy is read from
+// the spec fields that name the parent. Edges point from child to parent, as the owner
+// reference relations above do.
+const podGroupToWorkload = makeRelation(
+  'podgroup-workload',
+  PodGroup,
+  SchedulingWorkload,
+  (podGroup, workload) =>
+    !podGroup.parentCompositePodGroupName && podGroup.workloadName === workload.metadata.name
+);
+
+const podToPodGroup = makeRelation(
+  'pod-podgroup',
+  Pod,
+  PodGroup,
+  (pod, podGroup) => pod.spec.schedulingGroup?.podGroupName === podGroup.metadata.name
+);
+
+const compositePodGroupToWorkload = makeRelation(
+  'compositepodgroup-workload',
+  CompositePodGroup,
+  SchedulingWorkload,
+  (composite, workload) =>
+    !composite.parentCompositePodGroupName && composite.workloadName === workload.metadata.name
+);
+
+const compositePodGroupToParent = makeRelation(
+  'compositepodgroup-parent',
+  CompositePodGroup,
+  CompositePodGroup,
+  (child, parent) =>
+    child.metadata.uid !== parent.metadata.uid &&
+    child.parentCompositePodGroupName === parent.metadata.name
+);
+
+const podGroupToCompositePodGroup = makeRelation(
+  'podgroup-compositepodgroup',
+  PodGroup,
+  CompositePodGroup,
+  (podGroup, composite) => podGroup.parentCompositePodGroupName === composite.metadata.name
+);
 
 const backendTLSPolicyToService = makeRelation(
   'backendtlspolicy-service',
@@ -483,10 +700,18 @@ const staticRelations = [
   ingressToSecret,
   networkPolicyToPod,
   roleBindingsToRole,
+  roleBindingToClusterRole,
   roleBindingToServiceAccount,
+  clusterRoleBindingToClusterRole,
+  clusterRoleBindingToServiceAccount,
   serviceAccountToDeployments,
   serviceAccountToDaemonSets,
+  serviceAccountToStatefulSets,
   pvcToPods,
+  podToResourceClaim,
+  podToResourceClaimTemplate,
+  resourceClaimToDeviceClass,
+  resourceClaimTemplateToDeviceClass,
   podToOwner,
   replicaSetToOwner,
   jobToCronJob,
@@ -501,6 +726,11 @@ const staticRelations = [
   udpRouteToService,
   backendTLSPolicyToService,
   backendTrafficPolicyToService,
+  podGroupToWorkload,
+  podToPodGroup,
+  compositePodGroupToWorkload,
+  compositePodGroupToParent,
+  podGroupToCompositePodGroup,
 ];
 
 export { BUILT_IN_RELATION_IDS };
